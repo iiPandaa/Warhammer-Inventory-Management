@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<!-- 
+  Quick placeholder icon generator.
+  Open this in a browser, right-click each canvas → Save Image As
+  Save as icon-192.png and icon-512.png in the /assets/ folder
+-->
+<html>
+<body style="background:#0e0c0b;display:flex;gap:20px;padding:20px;align-items:flex-start">
+<div>
+  <p style="color:#d4cbbf;font-family:sans-serif;font-size:12px;margin-bottom:8px">192×192 (save as icon-192.png)</p>
+  <canvas id="c192" width="192" height="192"></canvas>
+</div>
+<div>
+  <p style="color:#d4cbbf;font-family:sans-serif;font-size:12px;margin-bottom:8px">512×512 (save as icon-512.png)</p>
+  <canvas id="c512" width="512" height="512"></canvas>
+</div>
+<script>
+function drawIcon(canvas) {
+  const ctx = canvas.getContext('2d');
+  const s = canvas.width;
+  const cx = s/2, cy = s/2, r = s*0.45;
+  
+  // Background
+  ctx.fillStyle = '#0e0c0b';
+  ctx.fillRect(0,0,s,s);
+  
+  // Outer ring
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0, Math.PI*2);
+  ctx.strokeStyle = '#d9663a';
+  ctx.lineWidth = s*0.04;
+  ctx.stroke();
+  
+  // Inner ring
+  ctx.beginPath();
+  ctx.arc(cx, cy, r*0.75, 0, Math.PI*2);
+  ctx.strokeStyle = '#a07840';
+  ctx.lineWidth = s*0.02;
+  ctx.stroke();
+  
+  // W letter
+  ctx.fillStyle = '#d9663a';
+  ctx.font = `bold ${s*0.42}px serif`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('W', cx, cy + s*0.02);
+  
+  // Cross marks at cardinal points
+  const pts = [[cx,cy-r],[cx,cy+r],[cx-r,cy],[cx+r,cy]];
+  pts.forEach(([x,y]) => {
+    ctx.beginPath();
+    ctx.arc(x, y, s*0.04, 0, Math.PI*2);
+    ctx.fillStyle = '#d9663a';
+    ctx.fill();
+  });
+}
+drawIcon(document.getElementById('c192'));
+drawIcon(document.getElementById('c512'));
+</script>
+</body>
+</html>

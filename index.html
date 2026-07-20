@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#d9663a">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="WH40K Tracker">
+  <title>Warhammer 40K — Collection Tracker</title>
+  <link rel="stylesheet" href="/css/styles.css">
+  <link rel="manifest" href="/manifest.json">
+  <link rel="apple-touch-icon" href="/assets/icon-192.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@400;600;700&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
+</head>
+<body>
+
+<!-- AUTH SCREEN -->
+<div id="auth-screen">
+  <div class="auth-box">
+    <div class="auth-header">
+      <h1>WH40K Tracker</h1>
+      <p>Munitorum Field Manual — Collection Manager</p>
+    </div>
+    <div class="auth-tabs">
+      <button class="auth-tab active" id="tab-signin">Sign In</button>
+      <button class="auth-tab" id="tab-signup">Create Account</button>
+    </div>
+    <div class="auth-form" id="auth-form">
+      <div class="auth-error" id="auth-error"></div>
+      <div class="auth-field" id="field-name" style="display:none">
+        <label>Display Name</label>
+        <input type="text" id="auth-name" placeholder="Your name" autocomplete="name">
+      </div>
+      <div class="auth-field">
+        <label>Email</label>
+        <input type="email" id="auth-email" placeholder="you@example.com" autocomplete="email">
+      </div>
+      <div class="auth-field">
+        <label>Password</label>
+        <input type="password" id="auth-password" placeholder="••••••••" autocomplete="current-password">
+      </div>
+      <button class="auth-submit" id="auth-submit">Sign In</button>
+    </div>
+  </div>
+</div>
+
+<div id="loading-overlay">
+  <div class="loader-title">Loading Collection Data</div>
+  <div class="loader-bar"><div class="loader-fill" id="loader-fill"></div></div>
+  <div class="loader-sub" id="loader-sub">Fetching points data...</div>
+</div>
+
+<header>
+  <div class="header-left">
+    <h1>Warhammer 40,000 Collection</h1>
+    <div class="subtitle">Points Tracker — Munitorum Field Manual v11</div>
+  </div>
+  <div class="header-right">
+    <div id="status"><div class="status-dot loading" id="status-dot"></div><span id="status-text">Loading…</span></div>
+    <div id="last-updated"></div>
+  </div>
+</header>
+
+<div class="app-body">
+
+  <!-- SIDEBAR -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-section" style="padding:8px 0 4px;">
+      <button class="faction-btn active" id="dash-btn" style="font-weight:600;letter-spacing:.04em;">
+        <span style="font-size:14px;line-height:1">⊞</span> Dashboard
+      </button>
+    </div>
+    <div class="sidebar-section" id="sidebar-40k">
+      <div class="sidebar-section-label">Warhammer 40,000</div>
+    </div>
+    <div class="sidebar-section" style="padding:4px 0 4px;border-top:1px solid var(--border);">
+      <div class="sidebar-section-label" style="border-top:none;margin-top:0;">Tools</div>
+      <button class="faction-btn" id="listcheck-btn" style="font-weight:600;letter-spacing:.04em;">
+        <span style="font-size:13px;line-height:1">⊟</span> List Checker
+      </button>
+    </div>
+    <div class="sidebar-totals" id="sidebar-totals">
+      <div class="st-label">Grand Total</div>
+      <div class="st-value" id="grand-pts-owned">—</div>
+      <div class="st-sub" id="grand-models">— models</div>
+    </div>
+  </aside>
+
+  <!-- DASHBOARD -->
+  <div id="dashboard-panel">
+    <div class="dash-wrap" id="dash-wrap">
+      <div class="dash-title">Collection Overview</div>
+      <!-- Grand summary injected by JS -->
+      <div id="dash-grand"></div>
+      <!-- Army cards injected by JS -->
+      <div class="dash-grid" id="dash-grid"></div>
+    </div>
+  </div>
+
+  <!-- LIST CHECKER -->
+  <div id="listcheck-panel">
+    <div class="lc-wrap">
+      <div class="lc-input-area">
+        <div class="lc-header-row">
+          <div class="lc-title">List Checker</div>
+          <div class="lc-faction-tag" id="lc-faction-tag">No list loaded</div>
+        </div>
+        <div class="lc-paste-row">
+          <textarea class="lc-textarea" id="lc-textarea" placeholder="Paste a list from Best Coast Pairings, Tabletop Battles, or any BCP-format export here…"></textarea>
+          <button class="lc-parse-btn" id="lc-parse-btn">Check List</button>
+        </div>
+      </div>
+      <div class="lc-summary hidden" id="lc-summary">
+        <div class="lc-sum-cell"><div class="lc-sum-label">List Points</div><div class="lc-sum-value dim" id="lcs-pts">—</div></div>
+        <div class="lc-sum-cell"><div class="lc-sum-label">Units in List</div><div class="lc-sum-value dim" id="lcs-units">—</div></div>
+        <div class="lc-sum-cell"><div class="lc-sum-label">Ready to Run</div><div class="lc-sum-value green" id="lcs-have">—</div></div>
+        <div class="lc-sum-cell"><div class="lc-sum-label">Need to Build</div><div class="lc-sum-value warn" id="lcs-build">—</div></div>
+        <div class="lc-sum-cell"><div class="lc-sum-label">Need to Buy</div><div class="lc-sum-value danger" id="lcs-buy">—</div></div>
+      </div>
+      <div class="lc-results" id="lc-results">
+        <div class="lc-empty">Paste a list above and click Check List</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MAIN -->
+  <div class="main-panel" id="main-panel">
+    <div class="faction-header">
+      <h2 id="faction-title">Loading…</h2>
+      <div class="fh-meta" id="faction-meta"></div>
+    </div>
+
+    <div class="totals-bar">
+      <div class="total-cell"><div class="tc-label">Models Owned</div><div class="tc-value" id="tot-owned">—</div></div>
+      <div class="total-cell"><div class="tc-label">Models Built</div><div class="tc-value" id="tot-built">—</div></div>
+      <div class="total-cell"><div class="tc-label">Models Painted</div><div class="tc-value" id="tot-painted">—</div></div>
+      <div class="total-cell"><div class="tc-label">Points Owned</div><div class="tc-value pts" id="tot-pts-owned">—</div></div>
+      <div class="total-cell"><div class="tc-label">Points Built</div><div class="tc-value pts" id="tot-pts-built">—</div></div>
+      <div class="total-cell"><div class="tc-label">MFM Changes</div><div class="tc-value" id="tot-changed" style="color:var(--changed-text)">—</div></div>
+    </div>
+
+    <div class="toolbar">
+      <input type="search" id="search-box" placeholder="Search units…">
+      <div class="sep"></div>
+      <label><input type="checkbox" id="filter-changed"> Changes only</label>
+      <label><input type="checkbox" id="filter-missing"> Not in MFM</label>
+      <div class="sep"></div>
+      <button class="btn" id="btn-refresh">↺ Refresh MFM</button>
+      <span id="save-indicator">Auto-save on</span>
+    </div>
+
+    <div class="legend">
+      <div class="legend-item"><div class="legend-swatch sw-changed"></div>Point value changed</div>
+      <div class="legend-item"><div class="legend-swatch sw-missing"></div>Not in MFM</div>
+      <span style="margin-left:6px;color:var(--text-faint)">Click shaded cells to edit · saves automatically</span>
+    </div>
+
+    <div class="table-wrap">
+      <table id="tracker-table">
+        <thead>
+          <tr>
+            <th>Unit</th><th>Qty</th><th>Bought</th><th>Models Built</th>
+            <th>Units Built</th><th>Painted</th><th>Pts/Unit (MFM)</th>
+            <th>Pts/Unit (Stored)</th><th>Total Pts Built</th>
+            <th>Total Pts Owned</th><th>Units Owned</th><th style="width:64px"></th>
+          </tr>
+        </thead>
+        <tbody id="tracker-body"></tbody>
+      </table>
+    </div>
+  </div>
+  </div>
+</div>
+
+<footer>
+  <span>MFM data via BSData/wh40k-11e-mfm · Unofficial, not affiliated with Games Workshop</span>
+  <span id="footer-version"></span>
+</footer>
+
+
+
+<!-- UNIT MODAL -->
+<div class="modal-backdrop hidden" id="unit-modal">
+  <div class="modal">
+    <div class="modal-header">
+      <h3 id="modal-title">Add Unit</h3>
+      <button class="modal-close" id="modal-close">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="field-group">
+        <label>Unit Name</label>
+        <div class="ac-wrap">
+          <input class="field-input" id="modal-unit-name" placeholder="Type to search MFM units…" autocomplete="off">
+          <div class="ac-list" id="ac-list"></div>
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field-group">
+          <label>Category</label>
+          <select class="field-input" id="modal-cat">
+            <option>Character</option><option>Battleline</option><option selected>Infantry</option>
+            <option>Monster</option><option>Mounted</option><option>Vehicle</option>
+            <option>Dedicated Transport</option>
+          </select>
+        </div>
+        <div class="field-group">
+          <label>Qty (Models)</label>
+          <input class="field-input" id="modal-qty" type="number" min="0" value="1">
+        </div>
+        <div class="field-group">
+          <label>Bought</label>
+          <select class="field-input" id="modal-bought">
+            <option value="Y">Yes</option><option value="N">No</option>
+          </select>
+        </div>
+      </div>
+      <div class="field-row3">
+        <div class="field-group">
+          <label>Models Built</label>
+          <input class="field-input" id="modal-model-built" type="number" min="0" value="0">
+        </div>
+        <div class="field-group">
+          <label>Units Built</label>
+          <input class="field-input" id="modal-units-built" type="number" min="0" value="0">
+        </div>
+        <div class="field-group">
+          <label>Units Owned</label>
+          <input class="field-input" id="modal-units-owned" type="number" min="1" value="1">
+        </div>
+        <div class="field-group">
+          <label>Painted</label>
+          <input class="field-input" id="modal-painted" type="number" min="0" value="0">
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field-group">
+          <label>Stored Pts/Unit</label>
+          <input class="field-input" id="modal-stored-pts" type="number" min="0" placeholder="(auto from MFM)">
+        </div>
+        <div class="field-group" style="grid-column:span 2">
+          <label>Note (optional)</label>
+          <input class="field-input" id="modal-note" type="text" placeholder="e.g. Shield loadout">
+        </div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-danger hidden" id="modal-delete">Delete Unit</button>
+      <button class="btn" id="modal-cancel">Cancel</button>
+      <button class="btn-primary" id="modal-save">Save Unit</button>
+    </div>
+  </div>
+</div>
+
+<!-- MOBILE BOTTOM NAV -->
+<nav class="mobile-nav">
+  <div class="mobile-nav-inner" id="mobile-nav-inner">
+    <button class="mobile-nav-btn active" id="mob-dash" data-target="dashboard">
+      <span class="nav-icon">⊞</span>Dashboard
+    </button>
+    <!-- Faction buttons injected by JS -->
+    <button class="mobile-nav-btn" id="mob-list" data-target="listcheck">
+      <span class="nav-icon">⊟</span>Lists
+    </button>
+  </div>
+</nav>
+
+<!-- Supabase SDK -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+
+<!-- App modules -->
+<script src="/js/data.js"></script>
+<script src="/js/mfm.js"></script>
+<script src="/js/supabase.js"></script>
+<script src="/js/app.js"></script>
+<script src="/js/ui.js"></script>
+
+</body>
+</html>
