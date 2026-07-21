@@ -1,10 +1,78 @@
 
-// ════════════════════════════════════════
-// data.js
-// ════════════════════════════════════════
+// ════════════════════════════════════════════════════
+// SUPABASE CONFIG
+// ════════════════════════════════════════════════════
+const SUPABASE_URL     = 'https://hvukiwyggawhyvpqmnrm.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh2dWtpd3lnZ2F3aHl2cHFtbnJtIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ1NzM4ODksImV4cCI6MjEwMDE0OTg4OX0.UGVDsfHEI5F4xRZ5jkPsi8uZYch__0uXya45FCfx5qo';
+let db; // initialised in DOMContentLoaded
 
-// Default faction roster data — edit unit entries here
+async function getSession() {
+  if (!db) return null;
+  const { data: { session } } = await db.auth.getSession();
+  return session;
+}
+async function signUp(email, password, displayName) {
+  return db.auth.signUp({ email, password, options: { data: { display_name: displayName } } });
+}
+async function signIn(email, password) {
+  return db.auth.signInWithPassword({ email, password });
+}
+async function signOut() {
+  return db.auth.signOut();
+}
 
+// ── Cloud roster helpers ──
+async function loadRosterFromCloud() {
+  if (!db) return null;
+  const { data, error } = await db.from('roster_units').select('*').order('faction_id, sort_order');
+  if (error) { console.error('loadRoster:', error); return null; }
+  return data;
+}
+async function hasExistingRoster() {
+  if (!db) return false;
+  const { count, error } = await db.from('roster_units').select('id', { count: 'exact', head: true });
+  return !error && count > 0;
+}
+async function upsertUnit(unitRow) {
+  if (!db) return;
+  const session = await getSession();
+  if (!session) return;
+  const { error } = await db.from('roster_units').upsert({ ...unitRow, user_id: session.user.id }, { onConflict: 'id' });
+  if (error) console.error('upsertUnit:', error);
+}
+async function deleteUnitFromCloud(id) {
+  if (!db || !id) return;
+  await db.from('roster_units').delete().eq('id', id);
+}
+async function seedFactionToCloud(factionId, units, userId) {
+  if (!db) return;
+  const rows = units.map((u, i) => ({
+    user_id: userId, faction_id: factionId,
+    unit: u.unit, cat: u.cat,
+    qty: u.qty ?? 0, bought: u.bought ?? 'N',
+    model_built: u.modelBuilt ?? 0, units_built: u.unitsBuilt ?? 0,
+    units_owned: u.unitsOwned ?? 1, painted: u.painted ?? 0,
+    stored_pts: u.storedPts ?? null, note: u.note ?? null, sort_order: i,
+  }));
+  const { error } = await db.from('roster_units').insert(rows);
+  if (error) console.error('seed:', error);
+}
+function dbRowToRoster(row) {
+  return {
+    _id: row.id, unit: row.unit, cat: row.cat,
+    qty: row.qty, bought: row.bought,
+    modelBuilt: row.model_built, unitsBuilt: row.units_built,
+    unitsOwned: row.units_owned, painted: row.painted,
+    storedPts: row.stored_pts, note: row.note,
+  };
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+// FACTION DEFINITIONS
+// yaml: BSData slug  |  extraYaml: additional slugs for cross-faction units
+// color: sidebar dot color
+// ═══════════════════════════════════════════════════════════════════
 const FACTIONS = [
   {
     id: 'csm', label: 'Chaos Space Marines', color: '#c04a4a',
@@ -242,20 +310,103 @@ const CAT_META  = {
   'Dedicated Transport':{key:'transport', dot:'dot-transport'},
 };
 
+const BASE_URL    = 'https://raw.githubusercontent.com/BSData/wh40k-11e-mfm/main/data/';
+const STORAGE_KEY = 'w40k-tracker-rosters-v1';
+const COLL_KEY    = 'w40k-tracker-collapsed-v1';
 
+// ═══════════════ STATE ═══════════════
+let mfmCache    = {};   // slug -> { unitName -> pts }
+let rosters     = loadRosters();
+let collapsedCats = loadCollapsed();
+let activeFactionId = null;
+let mfmVersion  = '';
 
-// ════════════════════════════════════════
-// mfm.js
-// ════════════════════════════════════════
+function loadRosters() {
+  // Try localStorage for offline/fast load
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) {
+      const saved = JSON.parse(raw);
+      if (saved && typeof saved === 'object') {
+        const result = FACTIONS.map(f => {
+          const sf = saved[f.id];
+          return sf && Array.isArray(sf) && sf.length > 0 ? sf.map(r=>({...r})) : f.roster.map(r=>({...r}));
+        });
+        return result;
+      }
+    }
+  } catch(e) {}
+  return FACTIONS.map(f => f.roster.map(r => ({...r})));
+}
 
-// ═══════════════════════════════════════════════════
-// MFM.JS — Munitorum Field Manual data fetch & parse
-// ═══════════════════════════════════════════════════
+async function initRosters() {
+  // Try cloud first
+  try {
+    const hasCloud = await hasExistingRoster();
+    if (hasCloud) {
+      const rows = await loadRosterFromCloud();
+      if (rows && rows.length > 0) {
+        rosters = FACTIONS.map(f => {
+          const fr = rows.filter(r => r.faction_id === f.id).sort((a,b) => a.sort_order - b.sort_order);
+          return fr.length > 0 ? fr.map(dbRowToRoster) : f.roster.map(r=>({...r}));
+        });
+        saveRosters(); // cache locally
+        return;
+      }
+    }
+    // No cloud data — seed defaults
+    const session = await getSession();
+    if (session) {
+      rosters = FACTIONS.map(f => f.roster.map(r => ({...r})));
+      for (let fi = 0; fi < FACTIONS.length; fi++) {
+        await seedFactionToCloud(FACTIONS[fi].id, FACTIONS[fi].roster, session.user.id);
+      }
+      // Reload to get IDs
+      const rows2 = await loadRosterFromCloud();
+      if (rows2) {
+        rosters = FACTIONS.map(f => {
+          const fr = rows2.filter(r => r.faction_id === f.id).sort((a,b) => a.sort_order - b.sort_order);
+          return fr.length > 0 ? fr.map(dbRowToRoster) : f.roster.map(r=>({...r}));
+        });
+      }
+      saveRosters();
+    }
+  } catch(e) {
+    console.warn('Cloud load failed, using local:', e);
+    rosters = loadRosters();
+  }
+}
 
-const BASE_URL = 'https://raw.githubusercontent.com/BSData/wh40k-11e-mfm/main/data/';
-let mfmCache   = {};
-let mfmVersion = '';
+function saveRosters() {
+  try {
+    const data = {};
+    FACTIONS.forEach((f, fi) => {
+      data[f.id] = rosters[fi].map((r, i) => ({...r, _idx: i}));
+    });
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+    flashSaved();
+  } catch(e) {}
+}
 
+function loadCollapsed() {
+  try {
+    const raw = localStorage.getItem(COLL_KEY);
+    if (raw) return new Set(JSON.parse(raw));
+  } catch(e) {}
+  return new Set();
+}
+
+function saveCollapsed() {
+  try { localStorage.setItem(COLL_KEY, JSON.stringify([...collapsedCats])); } catch(e) {}
+}
+
+function flashSaved() {
+  const el = document.getElementById('save-indicator');
+  el.textContent = '✓ Saved'; el.classList.add('saved');
+  setTimeout(() => { el.textContent = 'Auto-save on'; el.classList.remove('saved'); }, 1800);
+}
+
+// ═══════════════ YAML PARSER ═══════════════
 function parseYaml(text) {
   const result = {};
   const lines = text.replace(/\r\n/g,'\n').replace(/\r/g,'\n').split('\n');
@@ -279,26 +430,6 @@ function parseYaml(text) {
   return result;
 }
 
-async function fetchYaml(slug) {
-  if (mfmCache[slug]) return;
-  try {
-    const r = await fetch(BASE_URL + slug + '.yaml', { cache: 'no-cache' });
-    if (r.ok) { mfmCache[slug] = parseYaml(await r.text()); }
-    else { mfmCache[slug] = {}; }
-  } catch(e) { mfmCache[slug] = {}; }
-}
-
-async function fetchAllMfmData() {
-  const allSlugs = [...new Set(FACTIONS.flatMap(f => f.yaml))];
-  let done = 0;
-  await Promise.all(allSlugs.map(async slug => {
-    await fetchYaml(slug);
-    done++;
-  }));
-  const totalUnits = Object.values(mfmCache).reduce((a,c) => a + Object.keys(c).length, 0);
-  return { totalUnits, slugCount: allSlugs.length };
-}
-
 function lookupMfm(factionIdx, unitName) {
   const slugs = FACTIONS[factionIdx].yaml;
   for (const slug of slugs) {
@@ -315,505 +446,477 @@ function lookupMfm(factionIdx, unitName) {
   return null;
 }
 
+// ═══════════════ FETCH ═══════════════
+async function fetchYaml(slug) {
+  if (mfmCache[slug]) return;
+  try {
+    const r = await fetch(BASE_URL + slug + '.yaml', {cache:'no-cache'});
+    if (r.ok) { mfmCache[slug] = parseYaml(await r.text()); }
+    else { mfmCache[slug] = {}; }
+  } catch(e) { mfmCache[slug] = {}; }
+}
+
+async function fetchAllMfmData() {
+  setStatus('loading','Fetching MFM data…');
+  const allSlugs = [...new Set(FACTIONS.flatMap(f => f.yaml))];
+  let done = 0;
+  await Promise.all(allSlugs.map(async slug => {
+    await fetchYaml(slug);
+    done++;
+    setLoaderFill(Math.round((done / allSlugs.length) * 90));
+    setLoaderSub(`Loaded ${done}/${allSlugs.length} faction files…`);
+  }));
+  const totalUnits = Object.values(mfmCache).reduce((a,c) => a + Object.keys(c).length, 0);
+  setStatus('ok', `Live — ${totalUnits} units across ${allSlugs.length} factions`);
+  document.getElementById('last-updated').textContent = 'Updated ' + new Date().toLocaleTimeString();
+  if (mfmVersion) document.getElementById('footer-version').textContent = 'MFM ' + mfmVersion;
+  setLoaderFill(100);
+  setTimeout(() => {
+    document.getElementById('loading-overlay').classList.add('hidden');
+    buildSidebar();
+    showDashboard();
+  }, 250);
+}
+
+function setStatus(t,m){ document.getElementById('status-dot').className='status-dot '+t; document.getElementById('status-text').textContent=m; }
+function setLoaderFill(p){ document.getElementById('loader-fill').style.width=p+'%'; }
+function setLoaderSub(m){ document.getElementById('loader-sub').textContent=m; }
+
+// ═══════════════ SIDEBAR ═══════════════
+function factionTotals(fi) {
+  const faction = FACTIONS[fi];
+  let ptsOwned = 0, models = 0;
+  rosters[fi].forEach(row => {
+    const live = lookupMfm(fi, row.unit);
+    const pts  = live !== null ? live : (row.storedPts || 0);
+    ptsOwned += pts * (row.unitsOwned ?? 1);
+    models   += row.qty || 0;
+  });
+  return {ptsOwned, models};
+}
+
+function buildSidebar() {
+  const container = document.getElementById('sidebar-40k');
+  container.innerHTML = '<div class="sidebar-section-label">Warhammer 40,000</div>';
+  let grandPts = 0, grandModels = 0;
+  FACTIONS.forEach((f, fi) => {
+    const {ptsOwned, models} = factionTotals(fi);
+    grandPts    += ptsOwned;
+    grandModels += models;
+    const btn = document.createElement('button');
+    btn.className = 'faction-btn' + (f.id === activeFactionId ? ' active' : '');
+    btn.dataset.fid = f.id;
+    btn.innerHTML = `<span class="faction-dot" style="background:${f.color}"></span>${f.label}<span class="faction-pts">${ptsOwned.toLocaleString()}</span>`;
+    btn.addEventListener('click', () => showFaction(f.id));
+    container.appendChild(btn);
+  });
+  document.getElementById('grand-pts-owned').textContent  = grandPts.toLocaleString() + ' pts';
+  document.getElementById('grand-models').textContent     = grandModels.toLocaleString() + ' models';
+}
+
+// ═══════════════ RENDER FACTION ═══════════════
+function renderFaction(fid) {
+  const fi     = FACTIONS.findIndex(f => f.id === fid);
+  const faction = FACTIONS[fi];
+  const roster  = rosters[fi];
+
+  document.getElementById('faction-title').textContent = faction.label;
+  const slugList = faction.yaml.join(', ');
+  document.getElementById('faction-meta').textContent = `Source: ${slugList}`;
+
+  const searchVal      = (document.getElementById('search-box').value || '').toLowerCase();
+  const filterChanged  = document.getElementById('filter-changed').checked;
+  const filterMissing  = document.getElementById('filter-missing').checked;
+
+  const tbody = document.getElementById('tracker-body');
+  tbody.innerHTML = '';
+
+  let totOwned=0, totBuilt=0, totPainted=0, totPtsOwned=0, totPtsBuilt=0, changed=0;
+
+  // Group by category
+  const groups = {};
+  CAT_ORDER.forEach(c => { groups[c] = []; });
+  roster.forEach((row,idx) => {
+    const cat = row.cat || 'Infantry';
+    if (!groups[cat]) groups[cat] = [];
+    groups[cat].push({row,idx});
+  });
+
+  for (const cat of CAT_ORDER) {
+    const entries = groups[cat];
+    if (!entries || entries.length === 0) continue;
+
+    const visible = entries.filter(({row}) => {
+      const live = lookupMfm(fi, row.unit);
+      const ptsChanged = live !== null && row.storedPts !== null && live !== row.storedPts;
+      const ptsMissing = live === null;
+      if (searchVal && !row.unit.toLowerCase().includes(searchVal)) return false;
+      if (filterChanged && !ptsChanged) return false;
+      if (filterMissing && !ptsMissing) return false;
+      return true;
+    });
+    if ((filterChanged || filterMissing || searchVal) && visible.length === 0) continue;
+
+    // Category subtotals
+    let catPtsO=0, catPtsB=0, catMod=0;
+    entries.forEach(({row}) => {
+      const live = lookupMfm(fi, row.unit);
+      const pts  = live !== null ? live : (row.storedPts || 0);
+      catPtsO += pts * (row.unitsOwned ?? 1);
+      catPtsB += pts * (row.unitsBuilt ?? 0);
+      catMod  += row.qty || 0;
+    });
+
+    const meta = CAT_META[cat] || CAT_META['Infantry'];
+    const colKey = faction.id + ':' + cat;
+    const isCollapsed = collapsedCats.has(colKey);
+
+    const catTr = document.createElement('tr');
+    catTr.className = `cat-header cat-${meta.key}${isCollapsed?' collapsed':''}`;
+    catTr.dataset.cat = colKey;
+    catTr.innerHTML = `<td colspan="11"><span class="cat-chevron">▾</span>${cat}<span class="cat-sub">${catMod} models · ${catPtsO.toLocaleString()} pts owned · ${catPtsB.toLocaleString()} pts built</span></td>`;
+    catTr.addEventListener('click', () => {
+      if (collapsedCats.has(colKey)) collapsedCats.delete(colKey);
+      else collapsedCats.add(colKey);
+      saveCollapsed();
+      renderFaction(fid);
+    });
+    tbody.appendChild(catTr);
+
+    const rows = (searchVal || filterChanged || filterMissing) ? visible : entries;
+    rows.forEach(({row, idx}) => {
+      const live       = lookupMfm(fi, row.unit);
+      const unitsOwned = row.unitsOwned ?? 1;
+      const effPts     = live !== null ? live : row.storedPts;
+      const ptsChanged = live !== null && row.storedPts !== null && live !== row.storedPts;
+      const ptsMissing = live === null;
+
+      if (ptsChanged) changed++;
+      const totalO = effPts !== null ? effPts * unitsOwned : null;
+      const totalB = effPts !== null ? effPts * (row.unitsBuilt ?? 0) : null;
+      totOwned   += row.qty || 0;
+      totBuilt   += row.modelBuilt || 0;
+      totPainted += row.painted || 0;
+      if (totalO !== null) totPtsOwned += totalO;
+      if (totalB !== null) totPtsBuilt += totalB;
+
+      const delta = ptsChanged ? live - row.storedPts : 0;
+      const badge = ptsChanged ? `<span class="change-badge ${delta>0?'up':'down'}">${delta>0?'+':''}${delta}</span>` : '';
+      const dot   = `<span class="cat-dot ${meta.dot}"></span>`;
+      const note  = row.note ? ` <span style="color:var(--text-faint);font-size:10px">(${row.note})</span>` : '';
+
+      const tr = document.createElement('tr');
+      tr.className = 'data-row' + (ptsChanged?' row-changed':'') + (isCollapsed?' cat-hidden':'');
+      tr.dataset.cat = colKey;
+
+      tr.innerHTML = `
+        <td class="unit-name">${dot}${row.unit}${note}</td>
+        <td class="numeric editable" data-field="qty">${row.qty}</td>
+        <td class="${row.bought==='Y'?'bought-y':'bought-n'}">${row.bought==='Y'?'✓':'—'}</td>
+        <td class="numeric editable" data-field="modelBuilt">${row.modelBuilt}</td>
+        <td class="numeric editable" data-field="unitsBuilt">${row.unitsBuilt}</td>
+        <td class="numeric editable" data-field="painted">${row.painted}</td>
+        ${live!==null ? `<td class="pts-live${ptsChanged?' pts-changed':''}">${live}${badge}</td>` : `<td class="pts-missing">Not in MFM</td>`}
+        <td class="pts-stored">${row.storedPts!==null&&row.storedPts!==undefined ? row.storedPts : '<span style="color:var(--text-faint)">—</span>'}</td>
+        ${totalB!==null&&totalB>0 ? `<td class="pts-total-built">${totalB.toLocaleString()}</td>` : `<td class="pts-total-built" style="color:var(--text-faint)">—</td>`}
+        ${totalO!==null ? `<td class="pts-total">${totalO.toLocaleString()}</td>` : `<td class="pts-total" style="color:var(--text-faint)">—</td>`}
+        <td class="numeric editable" data-field="unitsOwned">${unitsOwned}</td>
+        <td><div class="row-actions"><button class="row-btn edit-btn" data-fi="${fi}" data-idx="${idx}" title="Edit">✎</button><button class="row-btn del-btn" data-fi="${fi}" data-idx="${idx}" title="Delete">✕</button></div></td>
+      `;
+
+      // Wire edit/delete buttons
+      tr.querySelector('.edit-btn').addEventListener('click', e => {
+        e.stopPropagation();
+        openModal('edit', parseInt(e.currentTarget.dataset.fi), parseInt(e.currentTarget.dataset.idx));
+      });
+      tr.querySelector('.del-btn').addEventListener('click', e => {
+        e.stopPropagation();
+        modalFi  = parseInt(e.currentTarget.dataset.fi);
+        modalIdx = parseInt(e.currentTarget.dataset.idx);
+        deleteUnit();
+      });
+
+      tr.querySelectorAll('td[data-field]').forEach(td => {
+        td.classList.add('editable');
+        td.addEventListener('click', () => {
+          if (td.querySelector('input')) return;
+          const field = td.dataset.field;
+          const cur   = rosters[fi][idx][field] ?? 0;
+          const input = document.createElement('input');
+          input.type='number'; input.min='0'; input.value=cur;
+          td.textContent=''; td.appendChild(input);
+          input.focus(); input.select();
+          const commit = () => {
+            rosters[fi][idx][field] = Math.max(0, parseInt(input.value,10)||0);
+            saveRosters();
+            buildSidebar();
+            renderFaction(fid);
+          };
+          input.addEventListener('blur', commit);
+          input.addEventListener('keydown', e => { if(e.key==='Enter') input.blur(); if(e.key==='Escape') renderFaction(fid); });
+        });
+      });
+
+      tbody.appendChild(tr);
+    });
+
+    // "Add unit" row at bottom of each category
+    if (!searchVal && !filterChanged && !filterMissing) {
+      const addTr = document.createElement('tr');
+      addTr.className = 'add-row' + (isCollapsed ? ' cat-hidden' : '');
+      addTr.dataset.cat = colKey;
+      addTr.innerHTML = `<td colspan="12"><button class="add-unit-btn" data-fi="${fi}" data-cat="${cat}">+ Add unit to ${cat}</button></td>`;
+      addTr.querySelector('.add-unit-btn').addEventListener('click', e => {
+        e.stopPropagation();
+        modalFi = parseInt(e.currentTarget.dataset.fi);
+        openModal('add', modalFi, -1);
+        setTimeout(() => { document.getElementById('modal-cat').value = e.currentTarget.dataset.cat; }, 0);
+      });
+      tbody.appendChild(addTr);
+    }
+  }
+
+  document.getElementById('tot-owned').textContent     = totOwned.toLocaleString();
+  document.getElementById('tot-built').textContent     = totBuilt.toLocaleString();
+  document.getElementById('tot-painted').textContent   = totPainted.toLocaleString();
+  document.getElementById('tot-pts-owned').textContent = totPtsOwned.toLocaleString();
+  document.getElementById('tot-pts-built').textContent = totPtsBuilt.toLocaleString();
+  document.getElementById('tot-changed').textContent   = changed > 0 ? changed+' ⚑' : '0';
+}
+
+// ═══════════════ EVENTS ═══════════════
+// moved to DOMContentLoaded: document.getElementById('search-box').addEventList
+// moved to DOMContentLoaded: document.getElementById('filter-changed').addEvent
+// moved to DOMContentLoaded: document.getElementById('filter-missing').addEvent
+document.getElementById('btn-refresh').addEventListener('click', async () => {
+  mfmCache = {};
+  document.getElementById('loading-overlay').classList.remove('hidden');
+  setLoaderFill(0);
+  await fetchAllMfmData();
+  buildSidebar();
+  if (activeFactionId === null) showDashboard();
+  else renderFaction(activeFactionId);
+});
+
+
+// ═══════════════════════════════════════════════════
+// MODAL — Add / Edit / Delete units
+// ═══════════════════════════════════════════════════
+let modalMode   = 'add';   // 'add' | 'edit'
+let modalFi     = 0;
+let modalIdx    = -1;
+let acSelected  = -1;
+
 function getMfmUnitsForFaction(fi) {
   const slugs = FACTIONS[fi].yaml;
   const units = [];
   for (const slug of slugs) {
     const cache = mfmCache[slug] || {};
     for (const [name, pts] of Object.entries(cache)) {
-      if (!units.find(u => u.name === name)) units.push({ name, pts });
+      if (!units.find(u => u.name === name)) units.push({name, pts});
     }
   }
   return units.sort((a,b) => a.name.localeCompare(b.name));
 }
 
+function openModal(mode, fi, idx) {
+  modalMode = mode;
+  modalFi   = fi;
+  modalIdx  = idx;
 
-// ════════════════════════════════════════
-// supabase.js
-// ════════════════════════════════════════
+  document.getElementById('modal-title').textContent = mode === 'add' ? 'Add Unit' : 'Edit Unit';
+  document.getElementById('modal-delete').classList.toggle('hidden', mode === 'add');
 
-// ═══════════════════════════════════════════════════
-// SUPABASE CLIENT
-// ═══════════════════════════════════════════════════
-const SUPABASE_URL = 'https://hvukiwyggawhyvpqmnrm.supabase.co';
-const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh2dWtpd3lnZ2F3aHl2cHFtbnJtIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ1NzM4ODksImV4cCI6MjEwMDE0OTg4OX0.UGVDsfHEI5F4xRZ5jkPsi8uZYch__0uXya45FCfx5qo';
-
-// db is initialised in the DOMContentLoaded block at the bottom of this file
-let db;
-
-// ═══════════════════════════════════════════════════
-// AUTH HELPERS
-// ═══════════════════════════════════════════════════
-async function signUp(email, password, displayName) {
-  const { data, error } = await db.auth.signUp({
-    email,
-    password,
-    options: { data: { display_name: displayName } }
-  });
-  return { data, error };
-}
-
-async function signIn(email, password) {
-  const { data, error } = await db.auth.signInWithPassword({ email, password });
-  return { data, error };
-}
-
-async function signOut() {
-  const { error } = await db.auth.signOut();
-  return { error };
-}
-
-async function getSession() {
-  if (!db) return null;
-  const { data: { session } } = await db.auth.getSession();
-  return session;
-}
-
-// onAuthChange handled directly in DOMContentLoaded init block
-
-// ═══════════════════════════════════════════════════
-// ROSTER DATA HELPERS
-// ═══════════════════════════════════════════════════
-
-// Load all roster rows for the current user
-async function loadRosterFromCloud() {
-  const { data, error } = await db
-    .from('roster_units')
-    .select('*')
-    .order('faction_id, sort_order');
-  if (error) { console.error('loadRoster error:', error); return null; }
-  return data;
-}
-
-// Save a single unit row (upsert by id)
-async function saveUnit(unit) {
-  const session = await getSession();
-  if (!session) return { error: 'Not logged in' };
-  const { data, error } = await db
-    .from('roster_units')
-    .upsert({ ...unit, user_id: session.user.id }, { onConflict: 'id' })
-    .select();
-  return { data, error };
-}
-
-// Delete a unit by id
-async function deleteUnit(id) {
-  const { error } = await db
-    .from('roster_units')
-    .delete()
-    .eq('id', id);
-  return { error };
-}
-
-// Bulk upsert all units for a faction (used on first login to seed defaults)
-async function seedFactionRoster(factionId, units) {
-  const session = await getSession();
-  if (!session) return { error: 'Not logged in' };
-  const rows = units.map((u, i) => ({
-    user_id:     session.user.id,
-    faction_id:  factionId,
-    unit:        u.unit,
-    cat:         u.cat,
-    qty:         u.qty ?? 0,
-    bought:      u.bought ?? 'N',
-    model_built: u.modelBuilt ?? 0,
-    units_built: u.unitsBuilt ?? 0,
-    units_owned: u.unitsOwned ?? 1,
-    painted:     u.painted ?? 0,
-    stored_pts:  u.storedPts ?? null,
-    note:        u.note ?? null,
-    sort_order:  i,
-  }));
-  const { error } = await db.from('roster_units').insert(rows);
-  return { error };
-}
-
-// Check if user has any roster data yet
-async function hasExistingRoster() {
-  const { count, error } = await db
-    .from('roster_units')
-    .select('id', { count: 'exact', head: true });
-  if (error) return false;
-  return count > 0;
-}
-
-// ═══════════════════════════════════════════════════
-// SAVED LISTS HELPERS
-// ═══════════════════════════════════════════════════
-async function getSavedLists() {
-  const { data, error } = await db
-    .from('saved_lists')
-    .select('*')
-    .order('created_at', { ascending: false });
-  return { data, error };
-}
-
-async function saveList(name, rawText, faction) {
-  const session = await getSession();
-  if (!session) return { error: 'Not logged in' };
-  const { data, error } = await db
-    .from('saved_lists')
-    .insert({ user_id: session.user.id, name, raw_text: rawText, faction })
-    .select();
-  return { data, error };
-}
-
-async function deleteList(id) {
-  const { error } = await db.from('saved_lists').delete().eq('id', id);
-  return { error };
-}
-
-
-// ════════════════════════════════════════
-// app.js
-// ════════════════════════════════════════
-
-// ═══════════════════════════════════════════════════
-// APP.JS — State management + Supabase sync
-// ═══════════════════════════════════════════════════
-
-let rosters       = [];   // array of arrays, indexed by FACTIONS index
-let collapsedCats = new Set();
-let activeFactionId = null;
-let currentUser     = null;
-
-// ── Convert DB row → roster row format ──
-function dbRowToRosterRow(row) {
-  return {
-    _id:        row.id,           // supabase UUID, used for updates
-    unit:       row.unit,
-    cat:        row.cat,
-    qty:        row.qty,
-    bought:     row.bought,
-    modelBuilt: row.model_built,
-    unitsBuilt: row.units_built,
-    unitsOwned: row.units_owned,
-    painted:    row.painted,
-    storedPts:  row.stored_pts,
-    note:       row.note,
-  };
-}
-
-// ── Convert roster row → DB row format ──
-function rosterRowToDbRow(row, factionId, userId, sortOrder) {
-  return {
-    id:          row._id || undefined,   // undefined = let Supabase generate
-    user_id:     userId,
-    faction_id:  factionId,
-    unit:        row.unit,
-    cat:         row.cat,
-    qty:         row.qty ?? 0,
-    bought:      row.bought ?? 'N',
-    model_built: row.modelBuilt ?? 0,
-    units_built: row.unitsBuilt ?? 0,
-    units_owned: row.unitsOwned ?? 1,
-    painted:     row.painted ?? 0,
-    stored_pts:  row.storedPts ?? null,
-    note:        row.note ?? null,
-    sort_order:  sortOrder ?? 0,
-  };
-}
-
-// ── Initialise rosters (called after login) ──
-async function initRosters() {
-  const hasData = await hasExistingRoster();
-
-  if (hasData) {
-    // Load from cloud
-    const rows = await loadRosterFromCloud();
-    if (rows) {
-      // Build rosters array indexed by faction
-      rosters = FACTIONS.map(f => {
-        const factionRows = rows.filter(r => r.faction_id === f.id);
-        factionRows.sort((a,b) => a.sort_order - b.sort_order);
-        return factionRows.map(dbRowToRosterRow);
-      });
-      console.log('Loaded roster from Supabase:', rows.length, 'units');
-      return;
-    }
-  }
-
-  // No cloud data — seed from defaults
-  console.log('No existing roster, seeding defaults...');
-  rosters = FACTIONS.map(f => f.roster.map(r => ({...r})));
-  await seedAllFactions();
-}
-
-// ── Seed all default faction rosters to Supabase ──
-async function seedAllFactions() {
-  const session = await getSession();
-  if (!session) return;
-
-  for (let fi = 0; fi < FACTIONS.length; fi++) {
-    const f = FACTIONS[fi];
-    const { error } = await seedFactionRoster(f.id, f.roster);
-    if (error) console.error(`Seed error for ${f.id}:`, error);
-  }
-
-  // Reload from cloud to get generated IDs
-  const rows = await loadRosterFromCloud();
-  if (rows) {
-    rosters = FACTIONS.map(f => {
-      const factionRows = rows.filter(r => r.faction_id === f.id);
-      factionRows.sort((a,b) => a.sort_order - b.sort_order);
-      return factionRows.map(dbRowToRosterRow);
-    });
-  }
-  console.log('Seeded and loaded defaults');
-}
-
-// ── Save a single unit change ──
-async function saveUnitChange(fi, rowIdx) {
-  const session = await getSession();
-  if (!session) { saveLocally(); return; }
-
-  const row = rosters[fi][rowIdx];
-  const dbRow = rosterRowToDbRow(row, FACTIONS[fi].id, session.user.id, rowIdx);
-
-  const { data, error } = await saveUnit(dbRow);
-  if (error) {
-    console.error('Save error:', error);
-  } else if (data && data[0] && !row._id) {
-    // Store the generated ID back on the row
-    rosters[fi][rowIdx]._id = data[0].id;
-  }
-
-  // Also update localStorage as offline fallback
-  saveLocally();
-}
-
-// ── Add a new unit ──
-async function addUnit(fi, unitData) {
-  const session = await getSession();
-  const sortOrder = rosters[fi].length;
-  const newRow = { ...unitData };
-  rosters[fi].push(newRow);
-
-  if (session) {
-    const dbRow = rosterRowToDbRow(newRow, FACTIONS[fi].id, session.user.id, sortOrder);
-    const { data, error } = await saveUnit(dbRow);
-    if (error) { console.error('Add unit error:', error); }
-    else if (data && data[0]) { rosters[fi][rosters[fi].length - 1]._id = data[0].id; }
-  }
-  saveLocally();
-}
-
-// ── Delete a unit ──
-async function removeUnit(fi, rowIdx) {
-  const row = rosters[fi][rowIdx];
-  rosters[fi].splice(rowIdx, 1);
-
-  if (row._id) {
-    const { error } = await deleteUnit(row._id);
-    if (error) console.error('Delete error:', error);
-  }
-  saveLocally();
-}
-
-// ── localStorage fallback (for offline) ──
-const LOCAL_KEY = 'wh40k-tracker-offline-v2';
-
-function saveLocally() {
-  try {
-    const data = {};
-    FACTIONS.forEach((f, fi) => { data[f.id] = rosters[fi]; });
-    localStorage.setItem(LOCAL_KEY, JSON.stringify(data));
-  } catch(e) {}
-}
-
-function loadLocally() {
-  try {
-    const raw = localStorage.getItem(LOCAL_KEY);
-    if (!raw) return false;
-    const saved = JSON.parse(raw);
-    if (saved && typeof saved === 'object') {
-      rosters = FACTIONS.map(f => {
-        const savedFaction = saved[f.id];
-        if (savedFaction && Array.isArray(savedFaction)) return savedFaction;
-        return f.roster.map(r => ({...r}));
-      });
-      return true;
-    }
-  } catch(e) {}
-  return false;
-}
-
-// ── Collapsed category state ──
-const COLL_KEY = 'wh40k-tracker-collapsed-v1';
-
-function loadCollapsedState() {
-  try {
-    const raw = localStorage.getItem(COLL_KEY);
-    if (raw) collapsedCats = new Set(JSON.parse(raw));
-  } catch(e) {}
-}
-
-function saveCollapsedState() {
-  try { localStorage.setItem(COLL_KEY, JSON.stringify([...collapsedCats])); } catch(e) {}
-}
-
-
-// ════════════════════════════════════════
-// ui.js
-// ════════════════════════════════════════
-
-// ═══════════════════════════════════════════════════
-// UI.JS — Auth, rendering, events
-// ═══════════════════════════════════════════════════
-
-// ── AUTH UI ──
-let authMode = 'signin';
-
-function showAuthError(msg) {
-  const el = document.getElementById('auth-error');
-  el.textContent = msg;
-  el.classList.add('show');
-}
-
-function clearAuthError() {
-  document.getElementById('auth-error').classList.remove('show');
-}
-
-document.getElementById('tab-signin').addEventListener('click', () => {
-  authMode = 'signin';
-  document.getElementById('tab-signin').classList.add('active');
-  document.getElementById('tab-signup').classList.remove('active');
-  document.getElementById('field-name').style.display = 'none';
-  document.getElementById('auth-submit').textContent = 'Sign In';
-  clearAuthError();
-});
-
-document.getElementById('tab-signup').addEventListener('click', () => {
-  authMode = 'signup';
-  document.getElementById('tab-signup').classList.add('active');
-  document.getElementById('tab-signin').classList.remove('active');
-  document.getElementById('field-name').style.display = 'flex';
-  document.getElementById('auth-submit').textContent = 'Create Account';
-  clearAuthError();
-});
-
-document.getElementById('auth-submit').addEventListener('click', async () => {
-  const email    = document.getElementById('auth-email').value.trim();
-  const password = document.getElementById('auth-password').value;
-  const name     = document.getElementById('auth-name').value.trim();
-  clearAuthError();
-
-  if (!email || !password) { showAuthError('Please enter your email and password.'); return; }
-
-  const btn = document.getElementById('auth-submit');
-  btn.textContent = 'Please wait…';
-  btn.disabled = true;
-
-  if (authMode === 'signup') {
-    const { error } = await signUp(email, password, name || email.split('@')[0]);
-    if (error) { showAuthError(error.message); }
-    else { showAuthError('Check your email to confirm your account, then sign in.'); }
+  // Populate fields
+  if (mode === 'edit') {
+    const row = rosters[fi][idx];
+    document.getElementById('modal-unit-name').value    = row.unit;
+    document.getElementById('modal-cat').value          = row.cat || 'Infantry';
+    document.getElementById('modal-qty').value          = row.qty ?? 1;
+    document.getElementById('modal-bought').value       = row.bought ?? 'Y';
+    document.getElementById('modal-model-built').value  = row.modelBuilt ?? 0;
+    document.getElementById('modal-units-built').value  = row.unitsBuilt ?? 0;
+    document.getElementById('modal-units-owned').value  = row.unitsOwned ?? 1;
+    document.getElementById('modal-painted').value      = row.painted ?? 0;
+    document.getElementById('modal-stored-pts').value   = row.storedPts ?? '';
+    document.getElementById('modal-note').value         = row.note ?? '';
   } else {
-    const { error } = await signIn(email, password);
-    if (error) { showAuthError(error.message); }
+    document.getElementById('modal-unit-name').value    = '';
+    document.getElementById('modal-cat').value          = 'Infantry';
+    document.getElementById('modal-qty').value          = 1;
+    document.getElementById('modal-bought').value       = 'Y';
+    document.getElementById('modal-model-built').value  = 0;
+    document.getElementById('modal-units-built').value  = 0;
+    document.getElementById('modal-units-owned').value  = 1;
+    document.getElementById('modal-painted').value      = 0;
+    document.getElementById('modal-stored-pts').value   = '';
+    document.getElementById('modal-note').value         = '';
   }
 
-  btn.textContent = authMode === 'signup' ? 'Create Account' : 'Sign In';
-  btn.disabled = false;
-});
+  document.getElementById('unit-modal').classList.remove('hidden');
+  setTimeout(() => document.getElementById('modal-unit-name').focus(), 50);
+  updateAcList('');
+}
 
-// Enter key in auth form
-['auth-email','auth-password','auth-name'].forEach(id => {
-  document.getElementById(id)?.addEventListener('keydown', e => {
-    if (e.key === 'Enter') document.getElementById('auth-submit').click();
-  });
-});
+function closeModal() {
+  document.getElementById('unit-modal').classList.add('hidden');
+  document.getElementById('ac-list').classList.remove('open');
+}
 
-// Auth listener moved to bottom init block
+function saveModal() {
+  const name = document.getElementById('modal-unit-name').value.trim();
+  if (!name) { document.getElementById('modal-unit-name').focus(); return; }
 
-// ── BOOT ──
-async function bootApp() {
-  // Show loading overlay
-  document.getElementById('loading-overlay').classList.remove('hidden');
-  setLoaderFill(10);
-  setLoaderSub('Loading your roster…');
+  const storedRaw = document.getElementById('modal-stored-pts').value;
+  // If no stored pts entered, try to auto-fill from MFM
+  let storedPts = storedRaw !== '' ? parseInt(storedRaw, 10) : null;
+  if (storedPts === null) {
+    const live = lookupMfm(modalFi, name);
+    if (live !== null) storedPts = live;
+  }
 
-  // Load roster from Supabase (or seed defaults)
-  await initRosters();
-  setLoaderFill(40);
-  setLoaderSub('Fetching MFM data…');
+  const row = {
+    unit:        name,
+    cat:         document.getElementById('modal-cat').value,
+    qty:         parseInt(document.getElementById('modal-qty').value, 10) || 0,
+    bought:      document.getElementById('modal-bought').value,
+    modelBuilt:  parseInt(document.getElementById('modal-model-built').value, 10) || 0,
+    unitsBuilt:  parseInt(document.getElementById('modal-units-built').value, 10) || 0,
+    unitsOwned:  parseInt(document.getElementById('modal-units-owned').value, 10) || 1,
+    painted:     parseInt(document.getElementById('modal-painted').value, 10) || 0,
+    storedPts:   storedPts,
+    note:        document.getElementById('modal-note').value.trim() || undefined,
+  };
 
-  // Fetch MFM points data
-  const { totalUnits, slugCount } = await fetchAllMfmData();
-  setLoaderFill(90);
-
-  // Update header status
-  document.getElementById('status-dot').className = 'status-dot ok';
-  document.getElementById('status-text').textContent = `Live — ${totalUnits} units across ${slugCount} factions`;
-  document.getElementById('last-updated').textContent = 'Updated ' + new Date().toLocaleTimeString();
-
-  // Build user menu button in header
-  const displayName = currentUser.user_metadata?.display_name ||
-                      currentUser.email.split('@')[0];
-  const initials = displayName.split(' ').map(w=>w[0]).join('').toUpperCase().slice(0,2);
-  const headerRight = document.querySelector('.header-right');
-  if (!document.getElementById('user-menu-btn')) {
-    const userBtn = document.createElement('button');
-    userBtn.className = 'user-menu-btn';
-    userBtn.id = 'user-menu-btn';
-    userBtn.innerHTML = `<div class="user-avatar">${initials}</div><span>${displayName}</span>`;
-    userBtn.addEventListener('click', async () => {
-      if (confirm(`Sign out of ${currentUser.email}?`)) {
-        await signOut();
-      }
+  if (modalMode === 'add') {
+    rosters[modalFi].push(row);
+    saveRosters();
+    getSession().then(s => {
+      if (s) upsertUnit({
+        user_id: s.user.id, faction_id: FACTIONS[modalFi].id,
+        unit: row.unit, cat: row.cat, qty: row.qty, bought: row.bought,
+        model_built: row.modelBuilt||0, units_built: row.unitsBuilt||0,
+        units_owned: row.unitsOwned||1, painted: row.painted||0,
+        stored_pts: row.storedPts||null, note: row.note||null,
+        sort_order: rosters[modalFi].length - 1,
+      });
     });
-    headerRight.prepend(userBtn);
+  } else {
+    rosters[modalFi][modalIdx] = row;
+    saveRosters();
+    getSession().then(s => {
+      if (s && row._id) upsertUnit({
+        id: row._id, user_id: s.user.id, faction_id: FACTIONS[modalFi].id,
+        unit: row.unit, cat: row.cat, qty: row.qty, bought: row.bought,
+        model_built: row.modelBuilt||0, units_built: row.unitsBuilt||0,
+        units_owned: row.unitsOwned||1, painted: row.painted||0,
+        stored_pts: row.storedPts||null, note: row.note||null,
+        sort_order: modalIdx,
+      });
+    });
   }
 
-  setLoaderFill(100);
-  setTimeout(() => {
-    document.getElementById('loading-overlay').classList.add('hidden');
-    buildSidebar();
-    buildMobileNav();
-    showDashboard();
-  }, 250);
+  closeModal();
+  buildSidebar();
+  renderFaction(activeFactionId);
 }
 
-// ── SAVE INDICATOR ──
-function flashSaved() {
-  const el = document.getElementById('save-indicator');
-  if (!el) return;
-  el.textContent = '✓ Saved'; el.classList.add('saved');
-  setTimeout(() => { el.textContent = 'Auto-save on'; el.classList.remove('saved'); }, 1800);
+async function deleteUnit() {
+  if (!confirm('Delete this unit from your roster? This cannot be undone.')) return;
+  const row = rosters[modalFi][modalIdx];
+  rosters[modalFi].splice(modalIdx, 1);
+  saveRosters();
+  if (row && row._id) await deleteUnitFromCloud(row._id);
+  closeModal();
+  buildSidebar();
+  renderFaction(activeFactionId);
 }
 
-// ── STATUS HELPERS ──
-function setLoaderFill(p) { document.getElementById('loader-fill').style.width = p + '%'; }
-function setLoaderSub(m)  { document.getElementById('loader-sub').textContent = m; }
+// ── Autocomplete ──
+function updateAcList(query) {
+  const list  = document.getElementById('ac-list');
+  const units = getMfmUnitsForFaction(modalFi);
+  const q     = query.toLowerCase().trim();
+  const matches = q === ''
+    ? units.slice(0, 40)
+    : units.filter(u => u.name.toLowerCase().includes(q)).slice(0, 40);
 
-// ── MOBILE NAV ──
-function buildMobileNav() {
-  const inner = document.getElementById('mobile-nav-inner');
-  const listBtn = document.getElementById('mob-list');
+  list.innerHTML = '';
+  if (matches.length === 0) { list.classList.remove('open'); return; }
 
-  FACTIONS.forEach(f => {
-    const btn = document.createElement('button');
-    btn.className = 'mobile-nav-btn';
-    btn.dataset.fid = f.id;
-    btn.innerHTML = `<span class="nav-icon" style="color:${f.color}">●</span>${f.label.split(' ').slice(-1)[0]}`;
-    btn.addEventListener('click', () => showFaction(f.id));
-    inner.insertBefore(btn, listBtn);
+  matches.forEach((u, i) => {
+    const div = document.createElement('div');
+    div.className = 'ac-item';
+    div.dataset.idx = i;
+    div.innerHTML = `${u.name}<span class="ac-pts">${u.pts} pts</span>`;
+    div.addEventListener('mousedown', e => {
+      e.preventDefault();
+      selectAcItem(u);
+    });
+    list.appendChild(div);
   });
-
-  document.getElementById('mob-dash').addEventListener('click', showDashboard);
-  listBtn.addEventListener('click', showListChecker);
+  acSelected = -1;
+  list.classList.add('open');
 }
 
-function setMobileNav(target, fid) {
-  document.querySelectorAll('.mobile-nav-btn').forEach(b => {
-    if (target === 'faction') {
-      b.classList.toggle('active', b.dataset.fid === fid);
-    } else {
-      b.classList.toggle('active', b.dataset.target === target || b.id === 'mob-' + target);
-    }
-  });
+function selectAcItem(u) {
+  document.getElementById('modal-unit-name').value = u.name;
+  // Auto-fill stored pts if blank
+  if (!document.getElementById('modal-stored-pts').value) {
+    document.getElementById('modal-stored-pts').value = u.pts;
+  }
+  document.getElementById('ac-list').classList.remove('open');
 }
 
+// Keyboard nav in autocomplete
+document.getElementById('modal-unit-name').addEventListener('input', e => {
+  updateAcList(e.target.value);
+});
+document.getElementById('modal-unit-name').addEventListener('focus', e => {
+  updateAcList(e.target.value);
+});
+document.getElementById('modal-unit-name').addEventListener('blur', () => {
+  setTimeout(() => document.getElementById('ac-list').classList.remove('open'), 150);
+});
+document.getElementById('modal-unit-name').addEventListener('keydown', e => {
+  const list  = document.getElementById('ac-list');
+  const items = list.querySelectorAll('.ac-item');
+  if (!items.length) return;
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    acSelected = Math.min(acSelected + 1, items.length - 1);
+    items.forEach((el,i) => el.classList.toggle('active', i === acSelected));
+    items[acSelected]?.scrollIntoView({block:'nearest'});
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    acSelected = Math.max(acSelected - 1, 0);
+    items.forEach((el,i) => el.classList.toggle('active', i === acSelected));
+    items[acSelected]?.scrollIntoView({block:'nearest'});
+  } else if (e.key === 'Enter' && acSelected >= 0) {
+    e.preventDefault();
+    const units = getMfmUnitsForFaction(modalFi);
+    const q = document.getElementById('modal-unit-name').value.toLowerCase();
+    const matches = q === '' ? units.slice(0,40) : units.filter(u => u.name.toLowerCase().includes(q)).slice(0,40);
+    if (matches[acSelected]) selectAcItem(matches[acSelected]);
+  } else if (e.key === 'Escape') {
+    list.classList.remove('open');
+  }
+});
+
+// Modal button wiring
+document.getElementById('modal-close').addEventListener('click', closeModal);
+document.getElementById('modal-cancel').addEventListener('click', closeModal);
+document.getElementById('modal-save').addEventListener('click', saveModal);
+document.getElementById('modal-delete').addEventListener('click', deleteUnit);
+document.getElementById('unit-modal').addEventListener('click', e => {
+  if (e.target === document.getElementById('unit-modal')) closeModal();
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeModal();
+});
+
+
+// ═══════════════════════════════════════════════════
 // DASHBOARD
 // ═══════════════════════════════════════════════════
 function showDashboard() {
@@ -824,7 +927,6 @@ function showDashboard() {
   document.getElementById('dash-btn').classList.add('active');
   document.getElementById('listcheck-btn').classList.remove('active');
   document.querySelectorAll('.faction-btn:not(#dash-btn):not(#listcheck-btn)').forEach(b => b.classList.remove('active'));
-  setMobileNav('dashboard');
   renderDashboard();
 }
 
@@ -837,7 +939,6 @@ function showFaction(fid) {
   activeFactionId = fid;
   document.querySelectorAll('.faction-btn:not(#dash-btn):not(#listcheck-btn)').forEach(b =>
     b.classList.toggle('active', b.dataset.fid === fid));
-  setMobileNav('faction', fid);
   renderFaction(fid);
 }
 
@@ -1200,7 +1301,7 @@ function renderListResults(parsed) {
 }
 
 // ── Wire buttons ──
-document.getElementById('listcheck-btn').addEventListener('click', showListChecker);
+// moved to DOMContentLoaded: document.getElementById('listcheck-btn').addEventL
 document.getElementById('lc-parse-btn').addEventListener('click', () => {
   const text = document.getElementById('lc-textarea').value.trim();
   if (!text) return;
@@ -1215,36 +1316,152 @@ document.getElementById('lc-textarea').addEventListener('keydown', e => {
 });
 
 
-// ═══════════════════════════════════════════════════
-// INIT — Auth state change triggers bootApp()
-// ═══════════════════════════════════════════════════
-// Check for existing session on page load
+
+// ════════════════════════════════════════════════════
+// AUTH UI
+// ════════════════════════════════════════════════════
+let authMode = 'signin';
+
+function showAuthError(msg) {
+  const el = document.getElementById('auth-error');
+  if (el) { el.textContent = msg; el.style.display = 'block'; }
+}
+function clearAuthError() {
+  const el = document.getElementById('auth-error');
+  if (el) el.style.display = 'none';
+}
 
 
+async function bootApp() {
+  document.getElementById('loading-overlay').classList.remove('hidden');
+  setLoaderFill(10);
+  setLoaderSub('Loading your roster…');
 
-// ════════════════════════════════════════
-// INIT — runs after ALL code is defined
-// ════════════════════════════════════════
+  await initRosters();
+  setLoaderFill(50);
+  setLoaderSub('Fetching MFM data…');
+
+  await fetchAllMfmData();
+  setLoaderFill(90);
+
+  setStatus('ok', 'Live data loaded');
+  document.getElementById('last-updated').textContent = 'Updated ' + new Date().toLocaleTimeString();
+
+  // User display name in header
+  const session = await getSession();
+  if (session) {
+    const displayName = session.user.user_metadata?.display_name || session.user.email.split('@')[0];
+    const initials = displayName.split(' ').map(w=>w[0]).join('').toUpperCase().slice(0,2);
+    if (!document.getElementById('user-menu-btn')) {
+      const headerRight = document.querySelector('.header-right');
+      const userBtn = document.createElement('button');
+      userBtn.id = 'user-menu-btn';
+      userBtn.className = 'user-menu-btn';
+      userBtn.innerHTML = `<div class="user-avatar">${initials}</div><span>${displayName}</span>`;
+      userBtn.addEventListener('click', async () => {
+        if (confirm('Sign out?')) { await signOut(); }
+      });
+      if (headerRight) headerRight.prepend(userBtn);
+    }
+  }
+
+  setLoaderFill(100);
+  setTimeout(() => {
+    document.getElementById('loading-overlay').classList.add('hidden');
+    buildSidebar();
+    buildMobileNav();
+    showDashboard();
+  }, 200);
+}
+
+function buildMobileNav() {
+  const inner = document.getElementById('mobile-nav-inner');
+  if (!inner) return;
+  const listBtn = document.getElementById('mob-list');
+  document.querySelectorAll('.mobile-nav-btn[data-fid]').forEach(b => b.remove());
+  FACTIONS.forEach(f => {
+    const btn = document.createElement('button');
+    btn.className = 'mobile-nav-btn';
+    btn.dataset.fid = f.id;
+    btn.innerHTML = `<span class="nav-icon" style="color:${f.color}">●</span>${f.label.split(' ').slice(-1)[0]}`;
+    btn.addEventListener('click', () => showFaction(f.id));
+    inner.insertBefore(btn, listBtn);
+  });
+}
+
+
+// ════════════════════════════════════════════════════
+// INIT — safe to run after all functions defined
+// ════════════════════════════════════════════════════
 document.addEventListener('DOMContentLoaded', () => {
-  // Now safe to initialise Supabase — all functions are defined above
+
+  // Init Supabase
   const { createClient } = supabase;
   db = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-  // Wire auth state changes
+  // Auth tab switching
+  document.getElementById('tab-signin')?.addEventListener('click', () => {
+    authMode = 'signin';
+    document.getElementById('tab-signin').classList.add('active');
+    document.getElementById('tab-signup').classList.remove('active');
+    document.getElementById('field-name').style.display = 'none';
+    document.getElementById('auth-submit').textContent = 'Sign In';
+    clearAuthError();
+  });
+  document.getElementById('tab-signup')?.addEventListener('click', () => {
+    authMode = 'signup';
+    document.getElementById('tab-signup').classList.add('active');
+    document.getElementById('tab-signin').classList.remove('active');
+    document.getElementById('field-name').style.display = 'flex';
+    document.getElementById('auth-submit').textContent = 'Create Account';
+    clearAuthError();
+  });
+  document.getElementById('auth-submit')?.addEventListener('click', async () => {
+    const email    = document.getElementById('auth-email').value.trim();
+    const password = document.getElementById('auth-password').value;
+    const name     = document.getElementById('auth-name')?.value.trim() || '';
+    clearAuthError();
+    if (!email || !password) { showAuthError('Please enter email and password.'); return; }
+    const btn = document.getElementById('auth-submit');
+    btn.textContent = 'Please wait…'; btn.disabled = true;
+    if (authMode === 'signup') {
+      const { error } = await signUp(email, password, name || email.split('@')[0]);
+      if (error) showAuthError(error.message);
+      else showAuthError('Check your email to confirm, then sign in.');
+    } else {
+      const { error } = await signIn(email, password);
+      if (error) showAuthError(error.message);
+    }
+    btn.textContent = authMode === 'signup' ? 'Create Account' : 'Sign In';
+    btn.disabled = false;
+  });
+  ['auth-email','auth-password','auth-name'].forEach(id => {
+    document.getElementById(id)?.addEventListener('keydown', e => {
+      if (e.key === 'Enter') document.getElementById('auth-submit')?.click();
+    });
+  });
+
+  // Dashboard button
+  document.getElementById('dash-btn')?.addEventListener('click', showDashboard);
+  document.getElementById('mob-dash')?.addEventListener('click', showDashboard);
+  document.getElementById('listcheck-btn')?.addEventListener('click', showListChecker);
+  document.getElementById('mob-list')?.addEventListener('click', showListChecker);
+
+  // Auth state listener
   db.auth.onAuthStateChange(async (_event, session) => {
     if (session) {
-      currentUser = session.user;
-      const authScreen = document.getElementById('auth-screen');
-      if (authScreen) authScreen.classList.add('hidden');
-      await bootApp();
+      document.getElementById('auth-screen')?.classList.add('hidden');
+      if (!document.getElementById('loading-overlay').classList.contains('hidden') ||
+          !rosters.length) {
+        await bootApp();
+      }
     } else {
-      currentUser = null;
-      const authScreen = document.getElementById('auth-screen');
-      if (authScreen) authScreen.classList.remove('hidden');
+      document.getElementById('auth-screen')?.classList.remove('hidden');
+      document.getElementById('loading-overlay')?.classList.add('hidden');
     }
   });
 
-  // Register service worker
+  // Service worker
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('/sw.js').catch(console.error);
   }
