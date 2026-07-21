@@ -237,6 +237,3 @@ const CAT_META  = {
   'Dedicated Transport':{key:'transport', dot:'dot-transport'},
 };
 
-const BASE_URL    = 'https://raw.githubusercontent.com/BSData/wh40k-11e-mfm/main/data/';
-const STORAGE_KEY = 'w40k-tracker-rosters-v1';
-const COLL_KEY    = 'w40k-tracker-collapsed-v1';
