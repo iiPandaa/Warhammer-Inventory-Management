@@ -66,15 +66,18 @@ document.getElementById('auth-submit').addEventListener('click', async () => {
 });
 
 // ── AUTH STATE LISTENER ──
-onAuthChange(async (session) => {
-  if (session) {
-    currentUser = session.user;
-    document.getElementById('auth-screen').classList.add('hidden');
-    await bootApp();
-  } else {
-    currentUser = null;
-    document.getElementById('auth-screen').classList.remove('hidden');
-  }
+// Wrapped in DOMContentLoaded to ensure all modules are loaded first
+document.addEventListener('DOMContentLoaded', () => {
+  onAuthChange(async (session) => {
+    if (session) {
+      currentUser = session.user;
+      document.getElementById('auth-screen').classList.add('hidden');
+      await bootApp();
+    } else {
+      currentUser = null;
+      document.getElementById('auth-screen').classList.remove('hidden');
+    }
+  });
 });
 
 // ── BOOT ──
@@ -570,15 +573,10 @@ document.getElementById('lc-textarea').addEventListener('keydown', e => {
 // INIT — Auth state change triggers bootApp()
 // ═══════════════════════════════════════════════════
 // Check for existing session on page load
-(async () => {
-  const session = await getSession();
-  if (session) {
-    currentUser = session.user;
-    document.getElementById('auth-screen').classList.add('hidden');
-    await bootApp();
-  }
-  // Register service worker
-  if ('serviceWorker' in navigator) {
+// Session check and service worker registration handled in DOMContentLoaded above
+// Register service worker separately
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
     navigator.serviceWorker.register('/sw.js').catch(console.error);
-  }
-})();
+  });
+}
