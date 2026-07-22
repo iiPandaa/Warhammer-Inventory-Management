@@ -317,8 +317,8 @@ const COLL_KEY    = 'w40k-tracker-collapsed-v1';
 
 // ═══════════════ STATE ═══════════════
 let mfmCache    = {};   // slug -> { unitName -> pts }
-let rosters     = loadRosters();
-let collapsedCats = loadCollapsed();
+let rosters       = [];  // populated after auth in bootApp
+let collapsedCats = new Set();
 let activeFactionId = null;
 let mfmVersion  = '';
 
@@ -501,6 +501,14 @@ function buildSidebar() {
   });
   document.getElementById('grand-pts-owned').textContent  = grandPts.toLocaleString() + ' pts';
   document.getElementById('grand-models').textContent     = grandModels.toLocaleString() + ' models';
+
+  // Add New Army button at bottom of faction list
+  const addBtn = document.createElement('button');
+  addBtn.className = 'faction-btn';
+  addBtn.style.cssText = 'color:var(--text-faint);border-top:1px solid var(--border);margin-top:4px;font-style:italic;';
+  addBtn.innerHTML = '<span style="font-size:14px">+</span> Add New Army';
+  addBtn.addEventListener('click', openNewArmyModal);
+  container.appendChild(addBtn);
 }
 
 // ═══════════════ RENDER FACTION ═══════════════
@@ -674,9 +682,9 @@ function renderFaction(fid) {
 }
 
 // ═══════════════ EVENTS ═══════════════
-// moved to DOMContentLoaded: document.getElementById('search-box').addEventList
-// moved to DOMContentLoaded: document.getElementById('filter-changed').addEvent
-// moved to DOMContentLoaded: document.getElementById('filter-missing').addEvent
+// listener for search-box in DOMContentLoaded belowList
+// listener for filter-changed in DOMContentLoaded below
+// listener for filter-missing in DOMContentLoaded below
 document.getElementById('btn-refresh').addEventListener('click', async () => {
   mfmCache = {};
   document.getElementById('loading-overlay').classList.remove('hidden');
@@ -928,7 +936,9 @@ function showFaction(fid) {
   activeFactionId = fid;
   document.querySelectorAll('.faction-btn:not(#dash-btn):not(#listcheck-btn)').forEach(b =>
     b.classList.toggle('active', b.dataset.fid === fid));
+  setMobileNav('faction', fid);
   renderFaction(fid);
+  if (isMobile()) renderFactionMobile(fid);
 }
 
 function renderDashboard() {
@@ -1376,6 +1386,21 @@ async function bootApp() {
   }, 200);
 }
 
+
+function setMobileNav(target, fid) {
+  document.querySelectorAll('.mobile-nav-btn').forEach(b => {
+    if (target === 'faction') {
+      b.classList.toggle('active', b.dataset.fid === fid);
+    } else {
+      b.classList.toggle('active',
+        b.dataset.target === target ||
+        b.id === 'mob-' + target ||
+        (target === 'dashboard' && b.id === 'mob-dash') ||
+        (target === 'listcheck' && b.id === 'mob-list'));
+    }
+  });
+}
+
 function buildMobileNav() {
   const inner = document.getElementById('mobile-nav-inner');
   if (!inner) return;
@@ -1395,6 +1420,335 @@ function buildMobileNav() {
 // ════════════════════════════════════════════════════
 // INIT — safe to run after all functions defined
 // ════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════
+// MOBILE CARD RENDERER
+// Called instead of table rendering when on mobile
+// ═══════════════════════════════════════════════════
+function isMobile() { return window.innerWidth <= 768; }
+
+function renderFactionMobile(fid) {
+  const fi      = FACTIONS.findIndex(f => f.id === fid);
+  const faction = FACTIONS[fi];
+  const roster  = rosters[fi];
+  const tableWrap = document.querySelector('.table-wrap');
+  if (!tableWrap) return;
+
+  // Remove existing mobile list
+  document.querySelector('.mobile-unit-list')?.remove();
+
+  const container = document.createElement('div');
+  container.className = 'mobile-unit-list';
+
+  // Group by category
+  const groups = {};
+  const CAT_ORDER_LOCAL = ['Character','Battleline','Infantry','Monster','Mounted','Vehicle','Dedicated Transport'];
+  CAT_ORDER_LOCAL.forEach(c => { groups[c] = []; });
+  roster.forEach((row, idx) => {
+    const cat = row.cat || 'Infantry';
+    if (!groups[cat]) groups[cat] = [];
+    groups[cat].push({ row, idx });
+  });
+
+  let totOwned=0, totBuilt=0, totPainted=0, totPtsOwned=0, totPtsBuilt=0;
+
+  for (const cat of CAT_ORDER_LOCAL) {
+    const entries = groups[cat];
+    if (!entries || entries.length === 0) continue;
+
+    const catMeta  = CAT_META[cat] || CAT_META['Infantry'];
+    const colKey   = fid + ':' + cat;
+    const isCollapsed = collapsedCats.has(colKey);
+
+    // Category bar
+    const catEl = document.createElement('div');
+    let catPts = 0, catModels = 0;
+    entries.forEach(({row}) => {
+      const live = lookupMfm(fi, row.unit);
+      const pts  = live !== null ? live : (row.storedPts || 0);
+      catPts   += pts * (row.unitsOwned ?? 1);
+      catModels += row.qty || 0;
+    });
+    catEl.className = 'mobile-cat-header' + (isCollapsed ? ' collapsed' : '');
+    catEl.innerHTML = `
+      <span class="mobile-cat-chevron">▾</span>
+      <span style="color:var(--cat-${catMeta.key}-lit)">${cat}</span>
+      <span class="mobile-cat-sub">${catModels} models · ${catPts.toLocaleString()} pts</span>
+    `;
+    catEl.addEventListener('click', () => {
+      if (collapsedCats.has(colKey)) collapsedCats.delete(colKey);
+      else collapsedCats.add(colKey);
+      saveCollapsed();
+      renderFactionMobile(fid);
+    });
+    container.appendChild(catEl);
+
+    const unitsEl = document.createElement('div');
+    unitsEl.className = 'mobile-cat-units';
+
+    entries.forEach(({ row, idx }) => {
+      const live       = lookupMfm(fi, row.unit);
+      const effPts     = live !== null ? live : (row.storedPts || 0);
+      const unitsOwned = row.unitsOwned ?? 1;
+      const ptsChanged = live !== null && row.storedPts !== null && live !== row.storedPts;
+      const totalO     = effPts * unitsOwned;
+      const totalB     = effPts * (row.unitsBuilt ?? 0);
+
+      totOwned    += row.qty || 0;
+      totBuilt    += row.modelBuilt || 0;
+      totPainted  += row.painted || 0;
+      totPtsOwned += totalO;
+      totPtsBuilt += totalB;
+
+      const card = document.createElement('div');
+      card.className = 'unit-card' + (ptsChanged ? ' row-changed' : '');
+
+      const ptsDisplay = live !== null
+        ? `<span class="unit-card-pts${ptsChanged?' changed':''}">${live} pts${ptsChanged ? ' ⚑' : ''}</span>`
+        : `<span class="unit-card-pts" style="color:var(--text-faint);font-size:11px">No MFM data</span>`;
+
+      const noteHtml = row.note ? `<div class="unit-card-note">(${row.note})</div>` : '';
+
+      card.innerHTML = `
+        <div class="unit-card-header">
+          <span class="unit-card-dot" style="background:var(--cat-${catMeta.key}-lit)"></span>
+          <div style="flex:1;min-width:0">
+            <div class="unit-card-name">${row.unit}</div>
+            ${noteHtml}
+          </div>
+          ${ptsDisplay}
+        </div>
+        <div class="unit-card-stats">
+          <div class="unit-stat" data-field="qty">
+            <div class="unit-stat-label">Models</div>
+            <div class="unit-stat-value">${row.qty}</div>
+            <div class="unit-stat-hint">tap to edit</div>
+          </div>
+          <div class="unit-stat" data-field="modelBuilt">
+            <div class="unit-stat-label">Built</div>
+            <div class="unit-stat-value">${row.modelBuilt}</div>
+            <div class="unit-stat-hint">tap to edit</div>
+          </div>
+          <div class="unit-stat" data-field="painted">
+            <div class="unit-stat-label">Painted</div>
+            <div class="unit-stat-value">${row.painted}</div>
+            <div class="unit-stat-hint">tap to edit</div>
+          </div>
+        </div>
+        <div class="unit-card-footer">
+          <div class="unit-card-total">${totalO.toLocaleString()} pts owned · ${totalB.toLocaleString()} pts built</div>
+          <div class="unit-card-actions">
+            <button class="unit-card-btn edit-btn">Edit</button>
+          </div>
+        </div>
+      `;
+
+      // Tap to edit stat fields
+      card.querySelectorAll('.unit-stat').forEach(stat => {
+        stat.addEventListener('click', () => {
+          const field = stat.dataset.field;
+          const cur   = rosters[fi][idx][field] ?? 0;
+          const val   = prompt(`${row.unit} — ${field.replace(/([A-Z])/g,' $1')}:`, cur);
+          if (val === null) return;
+          const newVal = Math.max(0, parseInt(val, 10) || 0);
+          rosters[fi][idx][field] = newVal;
+          saveRosters();
+          const r = rosters[fi][idx];
+          getSession().then(s => {
+            if (s && r._id) upsertUnit({
+              id: r._id, user_id: s.user.id, faction_id: FACTIONS[fi].id,
+              unit: r.unit, cat: r.cat, qty: r.qty, bought: r.bought,
+              model_built: r.modelBuilt||0, units_built: r.unitsBuilt||0,
+              units_owned: r.unitsOwned||1, painted: r.painted||0,
+              stored_pts: r.storedPts||null, note: r.note||null, sort_order: idx,
+            });
+          });
+          buildSidebar();
+          renderFactionMobile(fid);
+        });
+      });
+
+      // Edit button
+      card.querySelector('.edit-btn').addEventListener('click', e => {
+        e.stopPropagation();
+        openModal('edit', fi, idx);
+      });
+
+      unitsEl.appendChild(card);
+    });
+
+    container.appendChild(unitsEl);
+
+    // Add unit button at bottom of each category
+    const addRowEl = document.createElement('div');
+    addRowEl.style.cssText = 'padding:4px 0;';
+    const addBtn2 = document.createElement('button');
+    addBtn2.className = 'add-unit-btn';
+    addBtn2.style.cssText = 'width:100%;margin:2px 0;';
+    addBtn2.textContent = `+ Add unit to ${cat}`;
+    addBtn2.addEventListener('click', () => {
+      openModal('add', fi, -1);
+      setTimeout(() => { document.getElementById('modal-cat').value = cat; }, 0);
+    });
+    addRowEl.appendChild(addBtn2);
+    container.appendChild(addRowEl);
+  }
+
+  tableWrap.appendChild(container);
+
+  // Update totals bar
+  document.getElementById('tot-owned').textContent     = totOwned.toLocaleString();
+  document.getElementById('tot-built').textContent     = totBuilt.toLocaleString();
+  document.getElementById('tot-painted').textContent   = totPainted.toLocaleString();
+  document.getElementById('tot-pts-owned').textContent = totPtsOwned.toLocaleString();
+  document.getElementById('tot-pts-built').textContent = totPtsBuilt.toLocaleString();
+}
+
+// ═══════════════════════════════════════════════════
+// NEW ARMY MODAL
+// ═══════════════════════════════════════════════════
+
+// Available BSData slugs for common factions not yet in the tracker
+const ALL_FACTIONS_AVAILABLE = [
+  { id: 'space-marines',       label: 'Space Marines',          color: '#4060a0', yaml: ['space-marines'] },
+  { id: 'blood-angels',        label: 'Blood Angels',           color: '#a02020', yaml: ['blood-angels'] },
+  { id: 'dark-angels',         label: 'Dark Angels',            color: '#204020', yaml: ['dark-angels'] },
+  { id: 'grey-knights',        label: 'Grey Knights',           color: '#8090a0', yaml: ['grey-knights'] },
+  { id: 'black-templars',      label: 'Black Templars',         color: '#202020', yaml: ['black-templars'] },
+  { id: 'deathwatch',          label: 'Deathwatch',             color: '#303030', yaml: ['deathwatch'] },
+  { id: 'thousand-sons',       label: 'Thousand Sons',          color: '#1040a0', yaml: ['thousand-sons'] },
+  { id: 'death-guard',         label: 'Death Guard',            color: '#505030', yaml: ['death-guard'] },
+  { id: 'emperors-children',   label: "Emperor's Children",     color: '#8030a0', yaml: ['emperors-children'] },
+  { id: 'tyranids',            label: 'Tyranids',               color: '#806020', yaml: ['tyranids'] },
+  { id: 'genestealer-cults',   label: 'Genestealer Cults',      color: '#604080', yaml: ['genestealer-cults'] },
+  { id: 'orks',                label: 'Orks',                   color: '#406020', yaml: ['orks'] },
+  { id: 'tau-empire',          label: "T'au Empire",            color: '#4090c0', yaml: ['tau-empire'] },
+  { id: 'eldar',               label: 'Aeldari',                color: '#30a060', yaml: ['aeldari'] },
+  { id: 'dark-eldar',          label: 'Drukhari',               color: '#502070', yaml: ['drukhari'] },
+  { id: 'harlequins',          label: 'Harlequins',             color: '#a06030', yaml: ['harlequins'] },
+  { id: 'leagues-of-votann',   label: 'Leagues of Votann',      color: '#b0a040', yaml: ['leagues-of-votann'] },
+  { id: 'chaos-space-marines', label: 'Chaos Space Marines',    color: '#c04a4a', yaml: ['chaos-space-marines'] },
+  { id: 'world-eaters',        label: 'World Eaters',           color: '#c03030', yaml: ['world-eaters'] },
+  { id: 'chaos-knights',       label: 'Chaos Knights',          color: '#8a3a8a', yaml: ['chaos-knights'] },
+  { id: 'imperial-knights',    label: 'Imperial Knights',       color: '#5a80c0', yaml: ['imperial-knights'] },
+  { id: 'adeptus-custodes',    label: 'Adeptus Custodes',       color: '#c89a50', yaml: ['adeptus-custodes'] },
+  { id: 'adepta-sororitas',    label: 'Adepta Sororitas',       color: '#c04080', yaml: ['adepta-sororitas'] },
+  { id: 'astra-militarum',     label: 'Astra Militarum',        color: '#7a7a40', yaml: ['astra-militarum'] },
+  { id: 'adeptus-mechanicus',  label: 'Adeptus Mechanicus',     color: '#a03020', yaml: ['adeptus-mechanicus'] },
+  { id: 'necrons',             label: 'Necrons',                color: '#40c080', yaml: ['necrons'] },
+];
+
+function openNewArmyModal() {
+  // Build list of factions not already tracked
+  const existingIds = FACTIONS.map(f => f.id);
+  const available = ALL_FACTIONS_AVAILABLE.filter(f => !existingIds.includes(f.id));
+
+  // Create modal HTML
+  const backdrop = document.createElement('div');
+  backdrop.className = 'modal-backdrop';
+  backdrop.id = 'new-army-modal';
+  backdrop.innerHTML = `
+    <div class="modal">
+      <div class="modal-header">
+        <h3>Add New Army</h3>
+        <button class="modal-close" id="new-army-close">✕</button>
+      </div>
+      <div class="modal-body" style="gap:8px">
+        <div class="field-group">
+          <label>Select Faction</label>
+          <input class="field-input" id="new-army-search" placeholder="Type to search factions…" autocomplete="off">
+        </div>
+        <div id="new-army-list" style="max-height:280px;overflow-y:auto;border:1px solid var(--border2);border-radius:4px;"></div>
+        <div style="font-size:10px;color:var(--text-faint)">
+          Can't find your faction? Use Custom below to add any army manually.
+        </div>
+        <details style="border:1px solid var(--border2);border-radius:4px;padding:10px">
+          <summary style="font-size:11px;color:var(--text-dim);cursor:pointer;letter-spacing:.04em">Custom faction</summary>
+          <div style="display:flex;flex-direction:column;gap:8px;margin-top:10px">
+            <div class="field-group"><label>Army Name</label><input class="field-input" id="new-army-custom-name" placeholder="e.g. Space Wolves"></div>
+            <div class="field-row">
+              <div class="field-group"><label>BSData Slug</label><input class="field-input" id="new-army-custom-slug" placeholder="e.g. space-wolves"></div>
+              <div class="field-group"><label>Color</label><input class="field-input" type="color" id="new-army-custom-color" value="#c04a4a"></div>
+            </div>
+            <button class="btn-primary" id="new-army-custom-add">Add Custom Army</button>
+          </div>
+        </details>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(backdrop);
+
+  function renderArmyList(filter) {
+    const list = document.getElementById('new-army-list');
+    const filtered = filter
+      ? available.filter(f => f.label.toLowerCase().includes(filter.toLowerCase()))
+      : available;
+    if (filtered.length === 0) {
+      list.innerHTML = '<div style="padding:12px;color:var(--text-faint);font-size:12px;text-align:center">No factions found</div>';
+      return;
+    }
+    list.innerHTML = filtered.map(f => `
+      <div class="ac-item" data-fid="${f.id}" style="display:flex;align-items:center;gap:8px;padding:8px 10px">
+        <span style="width:10px;height:10px;border-radius:50%;background:${f.color};flex-shrink:0;display:inline-block"></span>
+        ${f.label}
+      </div>
+    `).join('');
+    list.querySelectorAll('.ac-item').forEach(item => {
+      item.addEventListener('click', () => {
+        const fid = item.dataset.fid;
+        const faction = ALL_FACTIONS_AVAILABLE.find(f => f.id === fid);
+        if (faction) addNewArmy(faction);
+        closeNewArmyModal();
+      });
+    });
+  }
+
+  renderArmyList('');
+  document.getElementById('new-army-search').addEventListener('input', e => renderArmyList(e.target.value));
+  document.getElementById('new-army-close').addEventListener('click', closeNewArmyModal);
+  backdrop.addEventListener('click', e => { if (e.target === backdrop) closeNewArmyModal(); });
+
+  document.getElementById('new-army-custom-add').addEventListener('click', () => {
+    const name  = document.getElementById('new-army-custom-name').value.trim();
+    const slug  = document.getElementById('new-army-custom-slug').value.trim();
+    const color = document.getElementById('new-army-custom-color').value;
+    if (!name || !slug) { alert('Please enter both a name and BSData slug.'); return; }
+    addNewArmy({ id: slug, label: name, color, yaml: [slug] });
+    closeNewArmyModal();
+  });
+}
+
+function closeNewArmyModal() {
+  document.getElementById('new-army-modal')?.remove();
+}
+
+async function addNewArmy(factionDef) {
+  // Add to FACTIONS array
+  FACTIONS.push({ ...factionDef, roster: [] });
+  const fi = FACTIONS.length - 1;
+
+  // Add empty roster slot
+  rosters.push([]);
+
+  // Fetch MFM data for the new faction
+  for (const slug of factionDef.yaml) {
+    await fetchYaml(slug);
+  }
+
+  // Save updated faction list to localStorage
+  try {
+    const factionIds = FACTIONS.map(f => ({
+      id: f.id, label: f.label, color: f.color, yaml: f.yaml
+    }));
+    localStorage.setItem('wh40k-factions-' + STORAGE_KEY.split('-').pop(), JSON.stringify(factionIds));
+  } catch(e) {}
+
+  buildSidebar();
+  buildMobileNav();
+  showFaction(factionDef.id);
+}
+
+
 document.addEventListener('DOMContentLoaded', () => {
 
   // Init Supabase
@@ -1468,3 +1822,4 @@ document.addEventListener('DOMContentLoaded', () => {
     navigator.serviceWorker.register('/sw.js').catch(console.error);
   }
 });
+
