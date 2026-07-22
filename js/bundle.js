@@ -311,7 +311,8 @@ const CAT_META  = {
 };
 
 const BASE_URL    = 'https://raw.githubusercontent.com/BSData/wh40k-11e-mfm/main/data/';
-const STORAGE_KEY = 'w40k-tracker-rosters-v1';
+const STORAGE_KEY_BASE = 'w40k-tracker-rosters-v2';
+let STORAGE_KEY = STORAGE_KEY_BASE; // updated to user-scoped after login
 const COLL_KEY    = 'w40k-tracker-collapsed-v1';
 
 // ═══════════════ STATE ═══════════════
@@ -354,23 +355,11 @@ async function initRosters() {
         return;
       }
     }
-    // No cloud data — seed defaults
-    const session = await getSession();
-    if (session) {
-      rosters = FACTIONS.map(f => f.roster.map(r => ({...r})));
-      for (let fi = 0; fi < FACTIONS.length; fi++) {
-        await seedFactionToCloud(FACTIONS[fi].id, FACTIONS[fi].roster, session.user.id);
-      }
-      // Reload to get IDs
-      const rows2 = await loadRosterFromCloud();
-      if (rows2) {
-        rosters = FACTIONS.map(f => {
-          const fr = rows2.filter(r => r.faction_id === f.id).sort((a,b) => a.sort_order - b.sort_order);
-          return fr.length > 0 ? fr.map(dbRowToRoster) : f.roster.map(r=>({...r}));
-        });
-      }
-      saveRosters();
-    }
+    // No cloud data — new user gets empty rosters
+    // They add their own units via the + Add Unit buttons
+    rosters = FACTIONS.map(() => []);
+    saveRosters();
+    console.log('New user — starting with empty rosters');
   } catch(e) {
     console.warn('Cloud load failed, using local:', e);
     rosters = loadRosters();
@@ -1337,11 +1326,18 @@ async function bootApp() {
   setLoaderFill(10);
   setLoaderSub('Loading your roster…');
 
-  await initRosters();
-  setLoaderFill(50);
-  setLoaderSub('Fetching MFM data…');
+  // Scope localStorage to this user so accounts never share cached data
+  const session0 = await getSession();
+  if (session0) {
+    STORAGE_KEY = STORAGE_KEY_BASE + '-' + session0.user.id.slice(0, 8);
+  }
 
-  await fetchAllMfmData();
+  // Run roster load and MFM fetch in parallel for speed
+  setLoaderSub('Loading roster & MFM data…');
+  await Promise.all([
+    initRosters().then(() => setLoaderFill(60)),
+    fetchAllMfmData().then(() => setLoaderFill(80)),
+  ]);
   setLoaderFill(90);
 
   setStatus('ok', 'Live data loaded');
@@ -1359,7 +1355,13 @@ async function bootApp() {
       userBtn.className = 'user-menu-btn';
       userBtn.innerHTML = `<div class="user-avatar">${initials}</div><span>${displayName}</span>`;
       userBtn.addEventListener('click', async () => {
-        if (confirm('Sign out?')) { await signOut(); }
+        if (confirm('Sign out?')) {
+          // Clear this user's local cache so next user starts clean
+          try { localStorage.removeItem(STORAGE_KEY); } catch(e) {}
+          STORAGE_KEY = STORAGE_KEY_BASE;
+          rosters = [];
+          await signOut();
+        }
       });
       if (headerRight) headerRight.prepend(userBtn);
     }
