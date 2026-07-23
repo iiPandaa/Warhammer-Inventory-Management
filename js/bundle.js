@@ -5,6 +5,8 @@
 const SUPABASE_URL     = 'https://hvukiwyggawhyvpqmnrm.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh2dWtpd3lnZ2F3aHl2cHFtbnJtIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ1NzM4ODksImV4cCI6MjEwMDE0OTg4OX0.UGVDsfHEI5F4xRZ5jkPsi8uZYch__0uXya45FCfx5qo';
 let db; // initialised in DOMContentLoaded
+let bootInProgress = false; // true while bootApp() is running, to block overlapping boots
+let hasBootedOnce   = false; // true once bootApp() has completed for the current sign-in
 
 async function getSession() {
   if (!db) return null;
@@ -34,11 +36,15 @@ async function hasExistingRoster() {
   return !error && count > 0;
 }
 async function upsertUnit(unitRow) {
-  if (!db) return;
+  if (!db) return null;
   const session = await getSession();
-  if (!session) return;
-  const { error } = await db.from('roster_units').upsert({ ...unitRow, user_id: session.user.id }, { onConflict: 'id' });
-  if (error) console.error('upsertUnit:', error);
+  if (!session) return null;
+  const { data, error } = await db.from('roster_units')
+    .upsert({ ...unitRow, user_id: session.user.id }, { onConflict: 'id' })
+    .select()
+    .single();
+  if (error) { console.error('upsertUnit:', error); return null; }
+  return data;
 }
 async function deleteUnitFromCloud(id) {
   if (!db || !id) return;
@@ -700,6 +706,16 @@ function renderFaction(fid) {
           const commit = () => {
             rosters[fi][idx][field] = Math.max(0, parseInt(input.value,10)||0);
             saveRosters();
+            const r = rosters[fi][idx];
+            getSession().then(s => {
+              if (s && r._id) upsertUnit({
+                id: r._id, user_id: s.user.id, faction_id: userFactions[fi].id,
+                unit: r.unit, cat: r.cat, qty: r.qty, bought: r.bought,
+                model_built: r.modelBuilt||0, units_built: r.unitsBuilt||0,
+                units_owned: r.unitsOwned||1, painted: r.painted||0,
+                stored_pts: r.storedPts||null, note: r.note||null, sort_order: idx,
+              });
+            });
             buildSidebar();
             renderFaction(fid);
           };
@@ -841,18 +857,30 @@ function saveModal() {
 
   if (modalMode === 'add') {
     rosters[modalFi].push(row);
+    const newIdx = rosters[modalFi].length - 1;
     saveRosters();
     getSession().then(s => {
-      if (s) upsertUnit({
+      if (!s) return;
+      upsertUnit({
         user_id: s.user.id, faction_id: userFactions[modalFi].id,
         unit: row.unit, cat: row.cat, qty: row.qty, bought: row.bought,
         model_built: row.modelBuilt||0, units_built: row.unitsBuilt||0,
         units_owned: row.unitsOwned||1, painted: row.painted||0,
         stored_pts: row.storedPts||null, note: row.note||null,
-        sort_order: rosters[modalFi].length - 1,
+        sort_order: newIdx,
+      }).then(saved => {
+        // Attach the cloud-generated id right away so this unit can be
+        // edited again (inline or via modal) without needing a page reload first.
+        if (saved && saved.id && rosters[modalFi] && rosters[modalFi][newIdx]) {
+          rosters[modalFi][newIdx]._id = saved.id;
+          saveRosters();
+        }
       });
     });
   } else {
+    // Preserve the existing row's cloud id — it lives on the old row object
+    // and would otherwise be lost when we replace it with the freshly-built one below.
+    row._id = rosters[modalFi][modalIdx]._id;
     rosters[modalFi][modalIdx] = row;
     saveRosters();
     getSession().then(s => {
@@ -1915,16 +1943,28 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('mob-list')?.addEventListener('click', showListChecker);
 
   // Auth state listener
+  // NOTE: Supabase can fire this callback more than once for a single sign-in
+  // (e.g. an INITIAL_SESSION event followed by a SIGNED_IN event). Without a
+  // guard, that can kick off two overlapping bootApp() calls that both load
+  // and overwrite userFactions/rosters — whichever one finishes last wins,
+  // which could show the empty "Welcome" screen even for a user whose army
+  // data loaded correctly a moment earlier. bootInProgress/hasBootedOnce
+  // ensure bootApp() only ever runs once per signed-in session.
   db.auth.onAuthStateChange(async (_event, session) => {
     if (session) {
       document.getElementById('auth-screen')?.classList.add('hidden');
-      if (!document.getElementById('loading-overlay').classList.contains('hidden') ||
-          !rosters.length) {
+      if (hasBootedOnce || bootInProgress) return;
+      bootInProgress = true;
+      try {
         await bootApp();
+      } finally {
+        bootInProgress = false;
+        hasBootedOnce = true;
       }
     } else {
       document.getElementById('auth-screen')?.classList.remove('hidden');
       document.getElementById('loading-overlay')?.classList.add('hidden');
+      hasBootedOnce = false; // allow a clean re-boot if a different user signs in next
     }
   });
 
