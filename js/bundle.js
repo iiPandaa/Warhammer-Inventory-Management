@@ -73,7 +73,7 @@ function dbRowToRoster(row) {
 // yaml: BSData slug  |  extraYaml: additional slugs for cross-faction units
 // color: sidebar dot color
 // ═══════════════════════════════════════════════════════════════════
-const FACTIONS = [
+const FACTION_CATALOGUE = [
   {
     id: 'csm', label: 'Chaos Space Marines', color: '#c04a4a',
     yaml: ['chaos-space-marines', 'thousand-sons', 'death-guard', 'emperors-children'],
@@ -299,6 +299,8 @@ const FACTIONS = [
   },
 ];
 
+let userFactions = []; // user's active armies — populated after login
+
 const CAT_ORDER = ['Character','Battleline','Infantry','Monster','Mounted','Vehicle','Dedicated Transport'];
 const CAT_META  = {
   'Character':          {key:'character', dot:'dot-character'},
@@ -329,7 +331,7 @@ function loadRosters() {
     if (raw) {
       const saved = JSON.parse(raw);
       if (saved && typeof saved === 'object') {
-        const result = FACTIONS.map(f => {
+        const result = userFactions.map(f => {
           const sf = saved[f.id];
           return sf && Array.isArray(sf) && sf.length > 0 ? sf.map(r=>({...r})) : f.roster.map(r=>({...r}));
         });
@@ -337,7 +339,7 @@ function loadRosters() {
       }
     }
   } catch(e) {}
-  return FACTIONS.map(f => f.roster.map(r => ({...r})));
+  return userFactions.map(f => f.roster.map(r => ({...r})));
 }
 
 async function initRosters() {
@@ -347,34 +349,72 @@ async function initRosters() {
     if (hasCloud) {
       const rows = await loadRosterFromCloud();
       if (rows && rows.length > 0) {
-        rosters = FACTIONS.map(f => {
-          const fr = rows.filter(r => r.faction_id === f.id).sort((a,b) => a.sort_order - b.sort_order);
-          return fr.length > 0 ? fr.map(dbRowToRoster) : f.roster.map(r=>({...r}));
+        // Build userFactions from the distinct faction_ids in the DB
+        const factionIds = [...new Set(rows.map(r => r.faction_id))];
+        userFactions = factionIds
+          .map(id => FACTION_CATALOGUE.find(f => f.id === id))
+          .filter(Boolean);
+
+        // Also check localStorage for any custom factions not in catalogue
+        try {
+          const customKey = 'wh40k-custom-factions-' + STORAGE_KEY.split('-').pop();
+          const customRaw = localStorage.getItem(customKey);
+          if (customRaw) {
+            const customs = JSON.parse(customRaw);
+            customs.forEach(cf => {
+              if (!userFactions.find(f => f.id === cf.id)) {
+                userFactions.push(cf);
+              }
+            });
+          }
+        } catch(e) {}
+
+        // Build rosters indexed by userFactions
+        rosters = userFactions.map(f => {
+          const fr = rows.filter(r => r.faction_id === f.id)
+                        .sort((a,b) => a.sort_order - b.sort_order);
+          return fr.map(dbRowToRoster);
         });
-        saveRosters(); // cache locally
+        saveRosters();
         return;
       }
     }
-    // No cloud data — new user gets empty rosters
-    // They add their own units via the + Add Unit buttons
-    rosters = FACTIONS.map(() => []);
-    saveRosters();
-    console.log('New user — starting with empty rosters');
+    // No cloud data — brand new user, start completely empty
+    userFactions = [];
+    rosters = [];
+    console.log('New user — no armies yet');
   } catch(e) {
     console.warn('Cloud load failed, using local:', e);
-    rosters = loadRosters();
+    // Fall back to localStorage
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        const saved = JSON.parse(raw);
+        if (saved && saved.factions) {
+          userFactions = saved.factions
+            .map(id => FACTION_CATALOGUE.find(f => f.id === id) || saved.customFactions?.find(f => f.id === id))
+            .filter(Boolean);
+          rosters = userFactions.map(f => saved.rosters?.[f.id] || []);
+          return;
+        }
+      }
+    } catch(e2) {}
+    userFactions = [];
+    rosters = [];
   }
 }
 
 function saveRosters() {
   try {
-    const data = {};
-    FACTIONS.forEach((f, fi) => {
-      data[f.id] = rosters[fi].map((r, i) => ({...r, _idx: i}));
-    });
+    const data = {
+      factions: userFactions.map(f => f.id),
+      rosters: {},
+      customFactions: userFactions.filter(f => !FACTION_CATALOGUE.find(c => c.id === f.id)),
+    };
+    userFactions.forEach((f, fi) => { data.rosters[f.id] = rosters[fi] || []; });
     localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-    flashSaved();
   } catch(e) {}
+  flashSaved();
 }
 
 function loadCollapsed() {
@@ -420,7 +460,7 @@ function parseYaml(text) {
 }
 
 function lookupMfm(factionIdx, unitName) {
-  const slugs = FACTIONS[factionIdx].yaml;
+  const slugs = userFactions[factionIdx].yaml;
   for (const slug of slugs) {
     const cache = mfmCache[slug] || {};
     if (cache[unitName] !== undefined) return cache[unitName];
@@ -447,7 +487,7 @@ async function fetchYaml(slug) {
 
 async function fetchAllMfmData() {
   setStatus('loading','Fetching MFM data…');
-  const allSlugs = [...new Set(FACTIONS.flatMap(f => f.yaml))];
+  const allSlugs = [...new Set(FACTION_CATALOGUE.flatMap(f => f.yaml))];
   let done = 0;
   await Promise.all(allSlugs.map(async slug => {
     await fetchYaml(slug);
@@ -473,7 +513,7 @@ function setLoaderSub(m){ document.getElementById('loader-sub').textContent=m; }
 
 // ═══════════════ SIDEBAR ═══════════════
 function factionTotals(fi) {
-  const faction = FACTIONS[fi];
+  const faction = userFactions[fi];
   let ptsOwned = 0, models = 0;
   rosters[fi].forEach(row => {
     const live = lookupMfm(fi, row.unit);
@@ -488,16 +528,28 @@ function buildSidebar() {
   const container = document.getElementById('sidebar-40k');
   container.innerHTML = '<div class="sidebar-section-label">Warhammer 40,000</div>';
   let grandPts = 0, grandModels = 0;
-  FACTIONS.forEach((f, fi) => {
+  userFactions.forEach((f, fi) => {
     const {ptsOwned, models} = factionTotals(fi);
     grandPts    += ptsOwned;
     grandModels += models;
+    const wrap = document.createElement('div');
+    wrap.style.cssText = 'display:flex;align-items:center;position:relative;';
     const btn = document.createElement('button');
     btn.className = 'faction-btn' + (f.id === activeFactionId ? ' active' : '');
     btn.dataset.fid = f.id;
+    btn.style.flex = '1';
     btn.innerHTML = `<span class="faction-dot" style="background:${f.color}"></span>${f.label}<span class="faction-pts">${ptsOwned.toLocaleString()}</span>`;
     btn.addEventListener('click', () => showFaction(f.id));
-    container.appendChild(btn);
+    const delBtn = document.createElement('button');
+    delBtn.title = 'Remove army';
+    delBtn.style.cssText = 'background:none;border:none;color:var(--text-faint);padding:4px 8px;cursor:pointer;font-size:12px;flex-shrink:0;';
+    delBtn.textContent = '✕';
+    delBtn.addEventListener('click', e => { e.stopPropagation(); removeArmy(f.id); });
+    delBtn.addEventListener('mouseenter', () => delBtn.style.color = 'var(--danger-lit)');
+    delBtn.addEventListener('mouseleave', () => delBtn.style.color = 'var(--text-faint)');
+    wrap.appendChild(btn);
+    wrap.appendChild(delBtn);
+    container.appendChild(wrap);
   });
   document.getElementById('grand-pts-owned').textContent  = grandPts.toLocaleString() + ' pts';
   document.getElementById('grand-models').textContent     = grandModels.toLocaleString() + ' models';
@@ -513,8 +565,8 @@ function buildSidebar() {
 
 // ═══════════════ RENDER FACTION ═══════════════
 function renderFaction(fid) {
-  const fi     = FACTIONS.findIndex(f => f.id === fid);
-  const faction = FACTIONS[fi];
+  const fi     = userFactions.findIndex(f => f.id === fid);
+  const faction = userFactions[fi];
   const roster  = rosters[fi];
 
   document.getElementById('faction-title').textContent = faction.label;
@@ -705,7 +757,7 @@ let modalIdx    = -1;
 let acSelected  = -1;
 
 function getMfmUnitsForFaction(fi) {
-  const slugs = FACTIONS[fi].yaml;
+  const slugs = userFactions[fi].yaml;
   const units = [];
   for (const slug of slugs) {
     const cache = mfmCache[slug] || {};
@@ -790,7 +842,7 @@ function saveModal() {
     saveRosters();
     getSession().then(s => {
       if (s) upsertUnit({
-        user_id: s.user.id, faction_id: FACTIONS[modalFi].id,
+        user_id: s.user.id, faction_id: userFactions[modalFi].id,
         unit: row.unit, cat: row.cat, qty: row.qty, bought: row.bought,
         model_built: row.modelBuilt||0, units_built: row.unitsBuilt||0,
         units_owned: row.unitsOwned||1, painted: row.painted||0,
@@ -803,7 +855,7 @@ function saveModal() {
     saveRosters();
     getSession().then(s => {
       if (s && row._id) upsertUnit({
-        id: row._id, user_id: s.user.id, faction_id: FACTIONS[modalFi].id,
+        id: row._id, user_id: s.user.id, faction_id: userFactions[modalFi].id,
         unit: row.unit, cat: row.cat, qty: row.qty, bought: row.bought,
         model_built: row.modelBuilt||0, units_built: row.unitsBuilt||0,
         units_owned: row.unitsOwned||1, painted: row.painted||0,
@@ -924,7 +976,45 @@ function showDashboard() {
   document.getElementById('dash-btn').classList.add('active');
   document.getElementById('listcheck-btn').classList.remove('active');
   document.querySelectorAll('.faction-btn:not(#dash-btn):not(#listcheck-btn)').forEach(b => b.classList.remove('active'));
-  renderDashboard();
+  setMobileNav('dashboard');
+  if (!userFactions || userFactions.length === 0) {
+    renderWelcome();
+  } else {
+    renderDashboard();
+  }
+}
+
+function renderWelcome() {
+  const wrap = document.getElementById('dash-wrap');
+  if (!wrap) return;
+  wrap.innerHTML = `
+    <div style="max-width:480px;margin:40px auto;text-align:center;padding:0 20px;">
+      <div style="font-family:'Cinzel',serif;font-size:24px;font-weight:700;color:var(--rust-glow);letter-spacing:.1em;text-transform:uppercase;text-shadow:0 0 30px rgba(200,80,40,.4);margin-bottom:8px;">
+        Welcome, Commander
+      </div>
+      <div style="font-size:13px;color:var(--text-dim);margin-bottom:32px;line-height:1.7;">
+        Your collection tracker is ready. Add your first army to get started —
+        track your models, monitor live MFM points, and check lists against your inventory.
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:32px;text-align:center;">
+        <div style="background:var(--surface);border:1px solid var(--border2);border-radius:5px;padding:14px 10px;">
+          <div style="font-size:22px;margin-bottom:6px;">⚔️</div>
+          <div style="font-size:11px;color:var(--text-dim);line-height:1.4;">Track models owned, built &amp; painted</div>
+        </div>
+        <div style="background:var(--surface);border:1px solid var(--border2);border-radius:5px;padding:14px 10px;">
+          <div style="font-size:22px;margin-bottom:6px;">📋</div>
+          <div style="font-size:11px;color:var(--text-dim);line-height:1.4;">Live MFM points updated automatically</div>
+        </div>
+        <div style="background:var(--surface);border:1px solid var(--border2);border-radius:5px;padding:14px 10px;">
+          <div style="font-size:22px;margin-bottom:6px;">🎯</div>
+          <div style="font-size:11px;color:var(--text-dim);line-height:1.4;">Check army lists vs your collection</div>
+        </div>
+      </div>
+      <button onclick="openNewArmyModal()" style="background:var(--rust);border:1px solid var(--rust-lit);border-radius:5px;color:#f0ddd0;font-family:'Cinzel',serif;font-size:13px;letter-spacing:.08em;text-transform:uppercase;padding:12px 28px;cursor:pointer;">
+        + Add Your First Army
+      </button>
+    </div>
+  `;
 }
 
 function showFaction(fid) {
@@ -943,7 +1033,7 @@ function showFaction(fid) {
 
 function renderDashboard() {
   // ── Compute per-faction stats ──
-  const stats = FACTIONS.map((f, fi) => {
+  const stats = userFactions.map((f, fi) => {
     let modelsOwned=0, modelsBuilt=0, modelsPainted=0, ptsOwned=0, ptsBuilt=0, mfmChanges=0;
     rosters[fi].forEach(row => {
       const live = lookupMfm(fi, row.unit);
@@ -978,7 +1068,7 @@ function renderDashboard() {
     <div class="dash-grand">
       <div class="dash-grand-cell">
         <div class="dgc-label">Total Factions</div>
-        <div class="dgc-value gold">${FACTIONS.length}</div>
+        <div class="dgc-value gold">${userFactions.length}</div>
         <div class="dgc-sub">armies tracked</div>
       </div>
       <div class="dash-grand-cell">
@@ -1148,7 +1238,7 @@ function checkInventory(unitName, factionHint) {
   // Match by faction hint first (from list header)
   if (factionHint) {
     const hintLower = factionHint.toLowerCase();
-    FACTIONS.forEach((f, fi) => {
+    userFactions.forEach((f, fi) => {
       if (f.label.toLowerCase().includes(hintLower) ||
           hintLower.includes(f.label.toLowerCase().split(' ').slice(-1)[0].toLowerCase())) {
         factionIdxs.push(fi);
@@ -1158,7 +1248,7 @@ function checkInventory(unitName, factionHint) {
 
   // If no faction match, search all factions
   if (factionIdxs.length === 0) {
-    factionIdxs = FACTIONS.map((_, fi) => fi);
+    factionIdxs = userFactions.map((_, fi) => fi);
   }
 
   let totalOwned = 0;
@@ -1176,7 +1266,7 @@ function checkInventory(unitName, factionHint) {
       if (isMatch) {
         totalOwned += row.unitsOwned ?? 1;
         totalBuilt += row.unitsBuilt ?? 0;
-        if (!matchedFaction) matchedFaction = FACTIONS[fi].label;
+        if (!matchedFaction) matchedFaction = userFactions[fi].label;
       }
     }
   }
@@ -1406,7 +1496,7 @@ function buildMobileNav() {
   if (!inner) return;
   const listBtn = document.getElementById('mob-list');
   document.querySelectorAll('.mobile-nav-btn[data-fid]').forEach(b => b.remove());
-  FACTIONS.forEach(f => {
+  userFactions.forEach(f => {
     const btn = document.createElement('button');
     btn.className = 'mobile-nav-btn';
     btn.dataset.fid = f.id;
@@ -1428,8 +1518,8 @@ function buildMobileNav() {
 function isMobile() { return window.innerWidth <= 768; }
 
 function renderFactionMobile(fid) {
-  const fi      = FACTIONS.findIndex(f => f.id === fid);
-  const faction = FACTIONS[fi];
+  const fi      = userFactions.findIndex(f => f.id === fid);
+  const faction = userFactions[fi];
   const roster  = rosters[fi];
   const tableWrap = document.querySelector('.table-wrap');
   if (!tableWrap) return;
@@ -1556,7 +1646,7 @@ function renderFactionMobile(fid) {
           const r = rosters[fi][idx];
           getSession().then(s => {
             if (s && r._id) upsertUnit({
-              id: r._id, user_id: s.user.id, faction_id: FACTIONS[fi].id,
+              id: r._id, user_id: s.user.id, faction_id: userFactions[fi].id,
               unit: r.unit, cat: r.cat, qty: r.qty, bought: r.bought,
               model_built: r.modelBuilt||0, units_built: r.unitsBuilt||0,
               units_owned: r.unitsOwned||1, painted: r.painted||0,
@@ -1640,7 +1730,7 @@ const ALL_FACTIONS_AVAILABLE = [
 
 function openNewArmyModal() {
   // Build list of factions not already tracked
-  const existingIds = FACTIONS.map(f => f.id);
+  const existingIds = userFactions.map(f => f.id);
   const available = ALL_FACTIONS_AVAILABLE.filter(f => !existingIds.includes(f.id));
 
   // Create modal HTML
@@ -1723,31 +1813,48 @@ function closeNewArmyModal() {
 }
 
 async function addNewArmy(factionDef) {
-  // Add to FACTIONS array
-  FACTIONS.push({ ...factionDef, roster: [] });
-  const fi = FACTIONS.length - 1;
-
-  // Add empty roster slot
-  rosters.push([]);
-
-  // Fetch MFM data for the new faction
-  for (const slug of factionDef.yaml) {
-    await fetchYaml(slug);
+  // Don't add if already in user's list
+  if (userFactions.find(f => f.id === factionDef.id)) {
+    showFaction(factionDef.id);
+    return;
   }
-
-  // Save updated faction list to localStorage
-  try {
-    const factionIds = FACTIONS.map(f => ({
-      id: f.id, label: f.label, color: f.color, yaml: f.yaml
-    }));
-    localStorage.setItem('wh40k-factions-' + STORAGE_KEY.split('-').pop(), JSON.stringify(factionIds));
-  } catch(e) {}
-
+  userFactions.push({ ...factionDef, roster: [] });
+  rosters.push([]);
+  for (const slug of factionDef.yaml) { await fetchYaml(slug); }
+  saveRosters();
   buildSidebar();
   buildMobileNav();
   showFaction(factionDef.id);
 }
 
+
+
+async function removeArmy(fid) {
+  const fi = userFactions.findIndex(f => f.id === fid);
+  if (fi === -1) return;
+  const faction = userFactions[fi];
+
+  if (!confirm(`Remove ${faction.label} from your tracker? Your unit data will be deleted from the cloud. This cannot be undone.`)) return;
+
+  // Delete all units for this faction from Supabase
+  if (db) {
+    const session = await getSession();
+    if (session) {
+      await db.from('roster_units').delete()
+        .eq('user_id', session.user.id)
+        .eq('faction_id', fid);
+    }
+  }
+
+  // Remove from local arrays
+  userFactions.splice(fi, 1);
+  rosters.splice(fi, 1);
+  saveRosters();
+
+  buildSidebar();
+  buildMobileNav();
+  showDashboard();
+}
 
 document.addEventListener('DOMContentLoaded', () => {
 
