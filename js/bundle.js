@@ -592,8 +592,7 @@ function renderFaction(fid) {
   });
 
   for (const cat of CAT_ORDER) {
-    const entries = groups[cat];
-    if (!entries || entries.length === 0) continue;
+    const entries = groups[cat] || [];
 
     const visible = entries.filter(({row}) => {
       const live = lookupMfm(fi, row.unit);
@@ -604,6 +603,9 @@ function renderFaction(fid) {
       if (filterMissing && !ptsMissing) return false;
       return true;
     });
+    // Only skip a category when an active search/filter has hidden all of its units.
+    // Empty categories (e.g. a brand-new army with no units yet) still need to
+    // render their header and "Add unit" button so units can be added at all.
     if ((filterChanged || filterMissing || searchVal) && visible.length === 0) continue;
 
     // Category subtotals
@@ -1543,8 +1545,10 @@ function renderFactionMobile(fid) {
   let totOwned=0, totBuilt=0, totPainted=0, totPtsOwned=0, totPtsBuilt=0;
 
   for (const cat of CAT_ORDER_LOCAL) {
-    const entries = groups[cat];
-    if (!entries || entries.length === 0) continue;
+    const entries = groups[cat] || [];
+    // No search/filter here, so every category (even a brand-new, empty one)
+    // renders its header and "Add unit" button — otherwise a fresh army has
+    // no way to add its first unit.
 
     const catMeta  = CAT_META[cat] || CAT_META['Infantry'];
     const colKey   = fid + ':' + cat;
